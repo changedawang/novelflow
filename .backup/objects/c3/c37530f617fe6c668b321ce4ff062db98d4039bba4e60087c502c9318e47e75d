@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NovelFlow — AI小说翻译引擎</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/components.css">
+</head>
+<body>
+    <!-- 顶部导航 -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-icon">📖</span>
+                <span class="logo-text">NovelFlow</span>
+            </div>
+            <span class="logo-subtitle">AI小说翻译引擎</span>
+        </div>
+        <div class="header-right">
+            <button class="btn btn-ghost" id="btnSettings" title="设置">⚙️ 设置</button>
+            <button class="btn btn-ghost" id="btnExport" title="导出" disabled>📥 导出</button>
+        </div>
+    </header>
+
+    <!-- 主内容区 -->
+    <main class="main-content">
+        <!-- ===== 阶段1: 上传与配置 ===== -->
+        <section class="phase phase-upload" id="phaseUpload">
+            <div class="upload-area" id="uploadArea">
+                <div class="upload-icon">📄</div>
+                <h2>拖拽小说文件到此处</h2>
+                <p>支持 TXT 格式 · 支持大文件</p>
+                <label class="btn btn-primary upload-btn">
+                    选择文件
+                    <input type="file" id="fileInput" accept=".txt" hidden>
+                </label>
+                <div class="upload-demo">
+                    <button class="btn btn-link" id="btnDemo">或使用演示文本体验 →</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ===== 阶段2: 文件预览与确认 ===== -->
+        <section class="phase phase-preview hidden" id="phasePreview">
+            <div class="preview-card">
+                <div class="preview-header">
+                    <h3 id="previewFilename">文件名</h3>
+                    <button class="btn btn-ghost btn-sm" id="btnReupload">重新选择</button>
+                </div>
+                <div class="preview-stats">
+                    <div class="stat">
+                        <span class="stat-value" id="statChars">0</span>
+                        <span class="stat-label">总字符</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-value" id="statChapters">0</span>
+                        <span class="stat-label">章节</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-value" id="statSentences">0</span>
+                        <span class="stat-label">句子</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-value" id="statEstTokens">0</span>
+                        <span class="stat-label">预估Token</span>
+                    </div>
+                </div>
+                <div class="preview-text" id="previewText"></div>
+                <div class="preview-config">
+                    <div class="config-row">
+                        <label>API 提供商</label>
+                        <select id="cfgProvider">
+                            <option value="deepseek">DeepSeek</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="custom">自定义 (兼容OpenAI)</option>
+                        </select>
+                    </div>
+                    <div class="config-row">
+                        <label>API Key</label>
+                        <input type="password" id="cfgApiKey" placeholder="sk-...">
+                    </div>
+                    <div class="config-row" id="rowBaseUrl" style="display:none">
+                        <label>Base URL</label>
+                        <input type="text" id="cfgBaseUrl" placeholder="https://api.example.com/v1">
+                    </div>
+                    <div class="config-row">
+                        <label>模型</label>
+                        <input type="text" id="cfgModel" value="deepseek-chat">
+                    </div>
+                    <div class="config-row">
+                        <label>小说类型</label>
+                        <select id="cfgNovelType">
+                            <option value="通用">通用</option>
+                            <option value="奇幻">奇幻</option>
+                            <option value="科幻">科幻</option>
+                            <option value="文学">文学</option>
+                            <option value="言情">言情</option>
+                        </select>
+                    </div>
+                    <div class="config-row">
+                        <label>目标语言</label>
+                        <select id="cfgTargetLang">
+                            <option value="简体中文">简体中文</option>
+                            <option value="繁體中文">繁體中文</option>
+                            <option value="日本語">日本語</option>
+                        </select>
+                    </div>
+                    <details class="advanced-config">
+                        <summary>高级设置</summary>
+                        <div class="config-row">
+                            <label>滑动窗口</label>
+                            <input type="number" id="cfgWindowSize" value="8" min="2" max="20">
+                            <span class="config-hint">句</span>
+                        </div>
+                        <div class="config-row">
+                            <label>摘要间隔</label>
+                            <input type="number" id="cfgSummaryInterval" value="20" min="5" max="50">
+                            <span class="config-hint">句</span>
+                        </div>
+                        <div class="config-row">
+                            <label>Temperature</label>
+                            <input type="number" id="cfgTemperature" value="0.3" min="0" max="1" step="0.1">
+                        </div>
+                        <div class="config-row">
+                            <label>自动术语提取</label>
+                            <input type="checkbox" id="cfgAutoGlossary" checked>
+                        </div>
+                        <div class="config-row">
+                            <label>自动文风分析</label>
+                            <input type="checkbox" id="cfgAutoStyle" checked>
+                        </div>
+                    </details>
+                </div>
+                <div class="preview-actions">
+                    <button class="btn btn-primary btn-lg" id="btnStartTranslate">🚀 开始翻译</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ===== 阶段3: 翻译中 ===== -->
+        <section class="phase phase-translate hidden" id="phaseTranslate">
+            <!-- 状态栏 -->
+            <div class="status-bar">
+                <div class="status-left">
+                    <span class="status-phase" id="statusPhase">准备中...</span>
+                    <span class="status-detail" id="statusDetail"></span>
+                </div>
+                <div class="status-right">
+                    <span class="status-tokens" id="statusTokens">Token: 0</span>
+                    <button class="btn btn-sm btn-warning" id="btnPause">⏸ 暂停</button>
+                    <button class="btn btn-sm btn-danger" id="btnCancel">✖ 取消</button>
+                </div>
+            </div>
+
+            <!-- 进度条 -->
+            <div class="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill" style="width:0%"></div>
+                </div>
+                <div class="progress-text">
+                    <span id="progressText">0 / 0 句</span>
+                    <span id="progressPercent">0%</span>
+                </div>
+            </div>
+
+            <!-- 标签页 -->
+            <div class="tabs">
+                <button class="tab active" data-tab="translation">📖 翻译对照</button>
+                <button class="tab" data-tab="glossary">📋 术语表 <span class="badge" id="glossaryCount">0</span></button>
+                <button class="tab" data-tab="style">🎨 文风</button>
+                <button class="tab" data-tab="summary">📝 摘要</button>
+            </div>
+
+            <!-- 翻译对照面板 -->
+            <div class="tab-panel active" id="panelTranslation">
+                <div class="translation-view">
+                    <div class="translation-col col-original">
+                        <div class="col-header">原文</div>
+                        <div class="col-content" id="colOriginal"></div>
+                    </div>
+                    <div class="translation-col col-translated">
+                        <div class="col-header">译文</div>
+                        <div class="col-content" id="colTranslated"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 术语表面板 -->
+            <div class="tab-panel" id="panelGlossary">
+                <div class="glossary-toolbar">
+                    <input type="text" class="glossary-search" id="glossarySearch" placeholder="🔍 搜索术语...">
+                    <button class="btn btn-sm btn-primary" id="btnAddTerm">+ 添加</button>
+                </div>
+                <div class="glossary-table-wrap">
+                    <table class="glossary-table">
+                        <thead>
+                            <tr>
+                                <th>原文</th>
+                                <th>译文</th>
+                                <th>类别</th>
+                                <th>频率</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="glossaryBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 文风面板 -->
+            <div class="tab-panel" id="panelStyle">
+                <div class="style-card" id="styleCard">
+                    <p class="style-placeholder">文风分析将在翻译开始后自动进行...</p>
+                </div>
+            </div>
+
+            <!-- 摘要面板 -->
+            <div class="tab-panel" id="panelSummary">
+                <div class="summary-section">
+                    <h4>📌 全局摘要</h4>
+                    <div class="summary-content" id="globalSummary">翻译开始后自动生成...</div>
+                </div>
+                <div class="summary-section">
+                    <h4>📑 章节摘要</h4>
+                    <div class="chapter-summaries" id="chapterSummaries"></div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- 设置弹窗 -->
+    <div class="modal-overlay hidden" id="settingsModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>⚙️ 设置</h3>
+                <button class="btn btn-ghost btn-sm modal-close" id="btnCloseSettings">✕</button>
+            </div>
+            <div class="modal-body">
+                <p>设置已整合到翻译配置面板中。</p>
+                <p>翻译过程中可随时修改术语表。</p>
+                <hr>
+                <h4>关于 NovelFlow</h4>
+                <p>基于三层记忆系统的AI小说翻译引擎：</p>
+                <ul>
+                    <li><strong>L1 全局层</strong>：文风 + 术语表 + 全局摘要</li>
+                    <li><strong>L2 章节层</strong>：当前章节摘要</li>
+                    <li><strong>L3 近邻层</strong>：前N句原文+译文滑动窗口</li>
+                </ul>
+                <p>每句翻译约消耗 ~1650 tokens，10万字小说约 ￥12（DeepSeek）。</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 添加术语弹窗 -->
+    <div class="modal-overlay hidden" id="addTermModal">
+        <div class="modal modal-sm">
+            <div class="modal-header">
+                <h3>添加术语</h3>
+                <button class="btn btn-ghost btn-sm modal-close" id="btnCloseAddTerm">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="config-row">
+                    <label>原文</label>
+                    <input type="text" id="termOriginal" placeholder="English name">
+                </div>
+                <div class="config-row">
+                    <label>译文</label>
+                    <input type="text" id="termTranslation" placeholder="中文译名">
+                </div>
+                <div class="config-row">
+                    <label>类别</label>
+                    <select id="termCategory">
+                        <option value="character">人物</option>
+                        <option value="location">地名</option>
+                        <option value="item">物品</option>
+                        <option value="organization">组织</option>
+                        <option value="concept">概念</option>
+                        <option value="other">其他</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" id="btnConfirmAddTerm" style="width:100%;margin-top:12px">确认添加</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 导出弹窗 -->
+    <div class="modal-overlay hidden" id="exportModal">
+        <div class="modal modal-sm">
+            <div class="modal-header">
+                <h3>📥 导出翻译结果</h3>
+                <button class="btn btn-ghost btn-sm modal-close" id="btnCloseExport">✕</button>
+            </div>
+            <div class="modal-body">
+                <button class="btn btn-primary export-option" id="exportTxtTransOnly">📄 仅译文 (TXT)</button>
+                <button class="btn btn-outline export-option" id="exportTxtBilingual">📄 双语对照 (TXT)</button>
+                <button class="btn btn-outline export-option" id="exportJson">📋 完整数据 (JSON)</button>
+                <button class="btn btn-outline export-option" id="exportGlossary">📋 术语表 (JSON)</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- JS模块 -->
+    <script src="js/utils.js"></script>
+    <script src="js/llm-adapter.js"></script>
+    <script src="js/text-splitter.js"></script>
+    <script src="js/glossary-manager.js"></script>
+    <script src="js/translation-engine.js"></script>
+    <script src="js/ui-controller.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
