@@ -212,7 +212,7 @@
                             <span id="live-progress-text">0%</span>
                             <button class="btn-paper btn-sm" id="btn-live-to-work">查看进度</button>
                         </div>
-<div class="live-api-log" id="live-api-log" style="display:none;padding:8px 12px;background:var(--paper-dim);border-bottom:1px solid var(--border-light);font-size:0.75rem;color:var(--text-dim);max-height:80px;overflow-y:auto;">
+<div class="live-api-log" id="live-api-log" style="display:none;padding:8px 12px;background:var(--paper-dim);border-bottom:1px solid var(--border-light);font-size:0.75rem;color:var(--text-dim);max-height:160px;overflow-y:auto;">
 <div id="live-api-status">等待API响应...</div>
 </div>
 <div class="live-reader-body" id="live-reader-body">
@@ -346,14 +346,15 @@
                     <div id="model-fetch-hint" style="font-size:.7rem;color:var(--text-dim);margin-top:3px;display:none"></div>
                 </div>
                 <div class="fg">
-                    <label>推理程度</label>
-                    <select id="api-reasoning">
-                        <option value="precise">🎯 精确 (Temp 0.1) — 术语一致性最高</option>
-                        <option value="balanced" selected>⚖️ 均衡 (Temp 0.3) — 推荐</option>
-                        <option value="creative">🎨 创意 (Temp 0.6) — 文风更自由</option>
-                        <option value="wild">🔥 奔放 (Temp 0.9) — 大胆意译</option>
-                        <option value="custom">⚙️ 自定义</option>
-                    </select>
+<label>生成风格 / 温度</label>
+<select id="api-reasoning">
+<option value="precise">🎯 保守 (Temp 0.1) — 稳定、术语一致</option>
+<option value="balanced" selected>⚖️ 均衡 (Temp 0.3) — 推荐</option>
+<option value="creative">🎨 丰富 (Temp 0.6) — 文风更自由</option>
+<option value="wild">🔥 大胆 (Temp 0.9) — 意译更强</option>
+<option value="custom">⚙️ 自定义</option>
+</select>
+                    <div style="font-size:.7rem;color:var(--text-dim);margin-top:4px">注：这里控制的是生成风格温度；原生思维链仅在模型 / 接口支持时显示在日志中。</div>
                 </div>
                 <div class="fg-row" id="custom-temp-group" style="display:none">
                     <div class="fg"><label>Temperature</label><input type="number" id="api-temp" value="0.3" step="0.1" min="0" max="2"></div>
@@ -372,7 +373,32 @@
                     <label style="flex:1;margin:0">🔄 自动优化 <span style="font-weight:400;font-size:.72rem;color:var(--text-dim)">（翻译完一章后自动润色）</span></label>
                     <input type="checkbox" id="auto-optimize" style="width:18px;height:18px">
                 </div>
-                <hr><p class="modal-note">🔒 所有密钥仅保存在本地浏览器，不会上传。支持多密钥自动轮询，限流时自动切换。</p>
+                <hr>
+                <div style="padding:10px;background:var(--paper-light);border-radius:var(--r-md);border:1px solid var(--border-light);margin-bottom:12px">
+                    <div style="font-family:var(--font-ui);font-size:.8rem;font-weight:600;color:var(--text-secondary);margin-bottom:8px">🧠 AI 原生推理（Thinking / Reasoning）</div>
+                    <p style="font-size:.7rem;color:var(--text-dim);margin:0 0 10px">支持 DeepSeek-R1、QwQ、o1/o3 等推理模型。不支持的模型会自动忽略此参数。</p>
+                    <div class="fg" style="margin-bottom:8px">
+                        <label>翻译推理强度</label>
+                        <select id="api-translate-reasoning-effort">
+                            <option value="low">低 — 快速，少推理</option>
+                            <option value="medium" selected>中 — 均衡（推荐）</option>
+                            <option value="high">高 — 深度推理，更准确</option>
+                        </select>
+                    </div>
+                    <div class="fg" style="margin-bottom:8px">
+                        <label>优化推理强度</label>
+                        <select id="api-optimize-reasoning-effort">
+                            <option value="low">低 — 快速润色</option>
+                            <option value="medium">中 — 均衡</option>
+                            <option value="high" selected>高 — 深度润色（推荐）</option>
+                        </select>
+                    </div>
+                    <div class="fg" style="display:flex;align-items:center;gap:12px">
+                        <label style="flex:1;margin:0">📡 显示思维链 <span style="font-weight:400;font-size:.72rem;color:var(--text-dim)">（日志中实时显示 AI 推理过程）</span></label>
+                        <input type="checkbox" id="api-show-reasoning" checked style="width:18px;height:18px">
+                    </div>
+                </div>
+                <p class="modal-note">🔒 所有密钥仅保存在本地浏览器，不会上传。支持多密钥自动轮询，限流时自动切换。</p>
 <div style="margin-top:var(--sp-md);padding:var(--sp-sm);background:var(--paper-light);border-radius:var(--r-md);border:1px solid var(--border-light)">
 <div style="font-family:var(--font-ui);font-size:.8rem;font-weight:600;color:var(--text-secondary);margin-bottom:6px">📦 数据备份（跨浏览器迁移）</div>
 <div style="display:flex;gap:8px;flex-wrap:wrap">

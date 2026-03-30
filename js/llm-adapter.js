@@ -87,22 +87,123 @@ class LLMAdapter {
         }
     }
 
+    _toPlainText(value) {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'string') return value;
+        if (Array.isArray(value)) {
+            return value.map(item => this._toPlainText(item)).filter(Boolean).join('');
+        }
+        if (typeof value === 'object') {
+            if (typeof value.text === 'string') return value.text;
+            if (typeof value.content === 'string') return value.content;
+            if (typeof value.reasoning_content === 'string') return value.reasoning_content;
+            if (typeof value.reasoning === 'string') return value.reasoning;
+            if (typeof value.thinking === 'string') return value.thinking;
+            if (Array.isArray(value.content)) return this._toPlainText(value.content);
+            if (Array.isArray(value.text)) return this._toPlainText(value.text);
+            if (Array.isArray(value.parts)) return this._toPlainText(value.parts);
+        }
+        return '';
+    }
+
+    _extractChoiceText(choice) {
+        const message = choice && choice.message ? choice.message : {};
+        return this._toPlainText(message.content);
+    }
+
+    _extractChoiceReasoning(choice) {
+        const message = choice && choice.message ? choice.message : {};
+        const candidates = [
+            message.reasoning_content,
+            message.reasoning_details,
+            message.reasoning,
+            message.thinking,
+            choice ? choice.reasoning_content : '',
+            choice ? choice.reasoning_details : '',
+            choice ? choice.reasoning : '',
+            choice ? choice.thinking : ''
+        ];
+        for (const candidate of candidates) {
+            const text = this._toPlainText(candidate);
+            if (text) return text;
+        }
+        return '';
+    }
+
+    _isUnsupportedReasoningOption(status, errText, options) {
+        if (!options || (!options.reasoningEffort && !options.reasoning)) return false;
+        const code = Number(status);
+        if (![400, 404, 415, 422].includes(code)) return false;
+        const text = String(errText || '').toLowerCase();
+        return text.includes('reasoning') && /(unsupported|not support|not supported|unrecognized|unknown|invalid|extra|unexpected|additional properties|not allowed|does not exist)/.test(text);
+    }
+
+    async _requestChatResponse(messages, options = {}, stream = false, allowReasoningFallback = true) {
+        if (!this.model) throw new Error('未配置模型，请先填写模型名或点击“获取模型”选择模型');
+
+        const temperature = options.temperature ?? 0.3;
+        const maxTokens = options.maxTokens ?? options.max_tokens ?? 800;
+        const reasoningMode = options._reasoningMode
+            || (options.reasoningEffort ? 'effort' : ((options.reasoning && typeof options.reasoning === 'object') ? 'object' : 'none'));
+        const requestedReasoningMode = options._requestedReasoningMode || reasoningMode;
+        const payload = {
+            model: this.model,
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+            stream: !!stream,
+        };
+
+        if (reasoningMode === 'effort' && options.reasoningEffort) payload.reasoning_effort = options.reasoningEffort;
+        if (reasoningMode === 'object' && options.reasoning && typeof options.reasoning === 'object') payload.reasoning = options.reasoning;
+
+        const response = await this._fetchWithTimeout(this.baseUrl + '/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type':'application/json', 'Authorization':'Bearer ' + this.currentKey },
+            body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+            const err = await response.text();
+            if (allowReasoningFallback && this._isUnsupportedReasoningOption(response.status, err, options)) {
+                const fallbackOptions = Object.assign({}, options, { _requestedReasoningMode: requestedReasoningMode });
+                if (reasoningMode === 'effort' && options.reasoning && typeof options.reasoning === 'object') {
+                    delete fallbackOptions.reasoningEffort;
+                    fallbackOptions._reasoningMode = 'object';
+                    return this._requestChatResponse(messages, fallbackOptions, stream, true);
+                }
+                delete fallbackOptions.reasoningEffort;
+                delete fallbackOptions.reasoning;
+                fallbackOptions._reasoningMode = 'none';
+                return this._requestChatResponse(messages, fallbackOptions, stream, false);
+            }
+            throw new Error(`API错误 (${response.status}): ${err}`);
+        }
+
+        try {
+            response._reasoningMeta = {
+                requestedMode: requestedReasoningMode,
+                finalMode: reasoningMode
+            };
+        } catch (e) {}
+
+        return response;
+    }
+
     /** 带密钥轮询的chat */
     async chat(messages, options = {}) {
-        const { temperature = 0.3, maxTokens = 800 } = options;
         const maxRotations = Math.max(this.apiKeys.length, 1); // 至少尝试1次
         let lastError;
         let triedKeys = new Set();
         
         for (let rot = 0; rot < maxRotations * 2; rot++) { // 允许多轮尝试
-            // 避免同一轮重复尝试同一个key
             if (triedKeys.has(this._keyIndex) && triedKeys.size >= this.apiKeys.length) {
                 break; // 所有key都试过了
             }
             triedKeys.add(this._keyIndex);
             
             try {
-                const res = await this._doChat(messages, temperature, maxTokens);
+                const res = await this._doChat(messages, options);
                 this._markSuccess();
                 return res;
             } catch (e) {
@@ -115,17 +216,12 @@ class LLMAdapter {
                 const isTimeout = errMsg.includes('timeout') || errMsg.includes('超时');
                 const isAborted = errMsg.includes('abort') || errMsg.includes('取消');
                 
-                // 被用户取消的请求，直接抛出不轮询
-                if (isAborted) {
-                    throw e;
-                }
+                if (isAborted) throw e;
                 
-                // 限流/鉴权/超时错误 → 轮询下一个key
                 if ((is429 || is401 || isTimeout) && this._rotateKey(is429 ? 'rate_limit' : is401 ? 'auth_error' : 'timeout')) {
                     continue;
                 }
                 
-                // 其他错误也尝试轮询
                 if (this._rotateKey('error')) continue;
                 break;
             }
@@ -133,50 +229,87 @@ class LLMAdapter {
         throw lastError;
     }
 
-    async _doChat(messages, temperature, maxTokens) {
-        if (!this.model) throw new Error('未配置模型，请先填写模型名或点击“获取模型”选择模型');
-        const response = await this._fetchWithTimeout(this.baseUrl + '/chat/completions', {
-            method: 'POST',
-            headers: { 'Content-Type':'application/json', 'Authorization':'Bearer ' + this.currentKey },
-            body: JSON.stringify({ model:this.model, messages, temperature, max_tokens:maxTokens, stream:false }),
-        });
-        if (!response.ok) {
-            const err = await response.text();
-            throw new Error(`API错误 (${response.status}): ${err}`);
-        }
+    async _doChat(messages, options = {}) {
+        const response = await this._requestChatResponse(messages, options, false, true);
         const data = await response.json();
-        if (!data.choices || !data.choices[0]) throw new Error('API返回格式异常: ' + JSON.stringify(data).substring(0, 200));
-        var content = data.choices[0].message ? data.choices[0].message.content : null;
+        if (!data.choices || !data.choices[0]) {
+            throw new Error('API返回格式异常: ' + JSON.stringify(data).substring(0, 200));
+        }
+
+        const choice = data.choices[0];
+        const content = this._extractChoiceText(choice);
+        const reasoning = this._extractChoiceReasoning(choice);
+
         if (content === null || content === undefined || content === '') {
             throw new Error('模型返回空内容(content=null)，可能该模型不可用或不支持当前请求，请尝试更换模型');
         }
-        return { content: content, usage: data.usage || { prompt_tokens:0, completion_tokens:0, total_tokens:0 } };
+
+        return {
+            content: content,
+            reasoning: reasoning,
+            usage: data.usage || { prompt_tokens:0, completion_tokens:0, total_tokens:0 },
+            reasoningMeta: response._reasoningMeta || null
+        };
     }
 
     async *chatStream(messages, options = {}) {
-        if (!this.model) throw new Error('未配置模型，请先填写模型名或点击“获取模型”选择模型');
-        const { temperature = 0.3, maxTokens = 800 } = options;
-        const response = await this._fetchWithTimeout(this.baseUrl + '/chat/completions', {
-            method: 'POST',
-            headers: { 'Content-Type':'application/json', 'Authorization':'Bearer ' + this.currentKey },
-            body: JSON.stringify({ model:this.model, messages, temperature, max_tokens:maxTokens, stream:true }),
-        });
-        if (!response.ok) { const err = await response.text(); throw new Error(`API错误 (${response.status}): ${err}`); }
+        const response = await this._requestChatResponse(messages, options, true, true);
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+
+        if (response._reasoningMeta) {
+            yield { type: 'meta', reasoningMeta: response._reasoningMeta };
+        }
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+
             buffer += decoder.decode(value, { stream:true });
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
+
             for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed || !trimmed.startsWith('data: ')) continue;
+
                 const d = trimmed.slice(6);
                 if (d === '[DONE]') return;
-                try { const p = JSON.parse(d); if (p.choices?.[0]?.delta?.content) yield p.choices[0].delta.content; } catch(e) {}
+
+                try {
+                    const p = JSON.parse(d);
+                    if (p.usage) {
+                        yield { type: 'usage', usage: p.usage };
+                    }
+
+                    const choice = p.choices?.[0] || {};
+                    const delta = choice.delta || choice.message || {};
+                    const reasoningDelta = this._toPlainText(
+                        delta.reasoning_content !== undefined ? delta.reasoning_content
+                            : (delta.reasoning_details !== undefined ? delta.reasoning_details
+                            : (delta.reasoning !== undefined ? delta.reasoning
+                            : (delta.thinking !== undefined ? delta.thinking
+                            : (choice.reasoning_content !== undefined ? choice.reasoning_content
+                            : (choice.reasoning_details !== undefined ? choice.reasoning_details
+                            : (choice.reasoning !== undefined ? choice.reasoning
+                            : (choice.thinking !== undefined ? choice.thinking
+                            : (p.reasoning_content !== undefined ? p.reasoning_content
+                            : (p.reasoning_details !== undefined ? p.reasoning_details
+                            : (p.reasoning !== undefined ? p.reasoning : p.thinking))))))))))
+                    );
+                    if (reasoningDelta) {
+                        yield { type: 'reasoning', delta: reasoningDelta };
+                    }
+
+                    const contentDelta = this._toPlainText(
+                        delta.content !== undefined ? delta.content
+                            : (choice.content !== undefined ? choice.content : p.content)
+                    );
+                    if (contentDelta) {
+                        yield { type: 'content', delta: contentDelta };
+                    }
+                } catch(e) {}
             }
         }
     }

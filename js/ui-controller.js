@@ -194,7 +194,21 @@ this._openReader(book);
         return model;
     }
     _loadSettings() {
-        const raw = Utils.loadLocal('settings', { provider:'deepseek', apiKeys:[], baseUrl:'', model:'deepseek-chat', reasoning:'balanced', temperature:0.3, maxTokens:1024, batchSize:30, autoOptimize:false });
+        const raw = Utils.loadLocal('settings', {
+            provider:'deepseek',
+            apiKeys:[],
+            baseUrl:'',
+            model:'deepseek-chat',
+            reasoning:'balanced',
+            temperature:0.3,
+            maxTokens:1024,
+            batchSize:30,
+            autoOptimize:false,
+            translationReasoningEffort:'medium',
+            optimizeReasoningEffort:'high',
+            enableReasoningTrace:true,
+            streamReasoningTrace:true
+        });
         // 兼容旧版单key
         if (raw.apiKey && (!raw.apiKeys || raw.apiKeys.length === 0)) {
             raw.apiKeys = [raw.apiKey]; delete raw.apiKey;
@@ -203,6 +217,10 @@ this._openReader(book);
         raw.model = this._getEffectiveModel(raw.provider, raw.model);
         if (!raw.reasoning) raw.reasoning = 'balanced';
         if (!raw.batchSize) raw.batchSize = 30;
+        if (!['low', 'medium', 'high'].includes(String(raw.translationReasoningEffort || '').toLowerCase())) raw.translationReasoningEffort = 'medium';
+        if (!['low', 'medium', 'high'].includes(String(raw.optimizeReasoningEffort || '').toLowerCase())) raw.optimizeReasoningEffort = 'high';
+        if (raw.enableReasoningTrace === undefined) raw.enableReasoningTrace = true;
+        if (raw.streamReasoningTrace === undefined) raw.streamReasoningTrace = raw.enableReasoningTrace !== false;
         this.settings = raw;
     }
     _openSettingsModal() {
@@ -227,6 +245,9 @@ this._openReader(book);
         document.getElementById('batch-size').value = s.batchSize || 30;
         document.getElementById('batch-size-val').textContent = s.batchSize || 30;
         document.getElementById('auto-optimize').checked = !!s.autoOptimize;
+        document.getElementById('api-translate-reasoning-effort').value = s.translationReasoningEffort || 'medium';
+        document.getElementById('api-optimize-reasoning-effort').value = s.optimizeReasoningEffort || 'high';
+        document.getElementById('api-show-reasoning').checked = s.enableReasoningTrace !== false;
         this._toggleCustomUrl();
         this._toggleCustomTemp();
         document.getElementById('modal-settings').classList.remove('hidden');
@@ -613,6 +634,10 @@ this._showPage('work');
             autoGlossary: document.getElementById('cfg-glossary').checked,
             autoStyle: document.getElementById('cfg-style').checked,
             translationBatchSize: s.batchSize || 30,
+            translationReasoningEffort: s.translationReasoningEffort || 'medium',
+            optimizeReasoningEffort: s.optimizeReasoningEffort || 'high',
+            enableReasoningTrace: s.enableReasoningTrace !== false,
+            streamReasoningTrace: s.streamReasoningTrace !== false && s.enableReasoningTrace !== false,
         };
         const engine = new TranslationEngine(cfg);
         const runId = ++this._engineRunId;
@@ -1093,6 +1118,10 @@ this._showPage('work');
         this.engine = new TranslationEngine({
             api: { apiKeys: s.apiKeys, model, baseUrl: s.baseUrl, provider: s.provider },
             targetLang: book.targetLang || '简体中文',
+            translationReasoningEffort: s.translationReasoningEffort || 'medium',
+            optimizeReasoningEffort: s.optimizeReasoningEffort || 'high',
+            enableReasoningTrace: s.enableReasoningTrace !== false,
+            streamReasoningTrace: s.streamReasoningTrace !== false && s.enableReasoningTrace !== false,
         });
         if (book.glossary) this.engine.glossary.fromJSON(book.glossary);
         if (book.styleProfile) this.engine.styleProfile = book.styleProfile;
@@ -1223,7 +1252,7 @@ this._showPage('work');
             if (this.engine) this.engine.resume();
             document.getElementById('btn-pause').textContent = '⏸ 暂停优化';
             document.getElementById('ws-phase').textContent = '✨ 优化中';
-            document.getElementById('ws-detail').textContent = currentChTitle ? `继续优化 ${currentChTitle}` : '继续发送优化请求';
+            document.getElementById('ws-detail').textContent = currentChTitle ? `继续整章优化 ${currentChTitle}` : '继续发送整章优化请求';
             if (pauseBar) pauseBar.classList.remove('show');
             this._setDot('active');
             this._addInfoLog(currentChTitle ? `▶ 继续优化：${currentChTitle}` : '▶ 继续优化');
@@ -1655,6 +1684,22 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         }
     }
 
+    _formatReasoningEffortLabel(effort) {
+        const map = { low: '低', medium: '中', high: '高' };
+        return map[String(effort || '').toLowerCase()] || '';
+    }
+
+    _formatReasoningModeLabel(mode) {
+        const map = { effort: 'reasoning_effort', object: 'reasoning.effort', none: '普通请求' };
+        return map[String(mode || '').toLowerCase()] || '';
+    }
+
+    _trimLogText(text, maxLen = 4000) {
+        const raw = String(text || '').trim();
+        if (!raw) return '';
+        return raw.length > maxLen ? raw.slice(0, maxLen) + '\n...(已截断)' : raw;
+    }
+
     _updateApiLog(d) {
         if (!d) return;
 
@@ -1678,14 +1723,44 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         const time = new Date().toLocaleTimeString();
         const taskLabel = d.type === 'optimize' ? '优化' : '翻译';
         const chapterLabel = d.chapterTitle ? ` · ${Utils.escapeHtml(d.chapterTitle)}` : '';
+        const effortText = this._formatReasoningEffortLabel(d.reasoningEffort);
+        const effortLabel = effortText ? ` · 原生推理${effortText}` : '';
+        const batchLabel = d.type === 'optimize'
+            ? `整章请求（${d.batch || 0}句）`
+            : `${d.batch || 0}句`;
+        const requestedModeText = this._formatReasoningModeLabel(d.reasoningRequestedMode);
+        const finalModeText = this._formatReasoningModeLabel(d.reasoningMode);
+        const reasoningModeMeta = requestedModeText
+            ? ` · 推理参数：${requestedModeText}${finalModeText && finalModeText !== requestedModeText ? ` → ${finalModeText}` : ''}`
+            : '';
+        const reasoningPreview = Utils.escapeHtml(this._trimLogText(d.reasoningPreview || d.reasoning || '', 1800));
+        const contentPreview = Utils.escapeHtml(this._trimLogText(d.contentPreview || d.content || '', 1400));
 
         if (logEl && statusEl) {
             logEl.style.display = 'block';
+
             if (d.status === 'requesting') {
-                statusEl.innerHTML = `<span style="color:var(--accent)">[${time}] 🔄 正在请求API（${taskLabel} ${d.batch || 0}句${chapterLabel}）</span>`;
+                statusEl.innerHTML = `<span style="color:var(--accent)">[${time}] 🔄 正在请求API（${taskLabel} ${batchLabel}${chapterLabel}${effortLabel}${reasoningModeMeta}）</span>`;
+            } else if (d.status === 'reasoning') {
+                statusEl.innerHTML = `<span style="color:#7c3aed">[${time}] 🧠 ${taskLabel}推理中${chapterLabel}${effortLabel}</span>${reasoningPreview ? `<div style="margin-top:6px;white-space:pre-wrap;line-height:1.5;color:#6b4ce6">${reasoningPreview}</div>` : ''}`;
+            } else if (d.status === 'streaming') {
+                const reasoningBlock = reasoningPreview
+                    ? `<div style="margin-top:6px;white-space:pre-wrap;line-height:1.45;color:#6b4ce6"><strong>思维链</strong><br>${reasoningPreview}</div>`
+                    : '';
+                const contentBlock = contentPreview
+                    ? `<div style="margin-top:6px;white-space:pre-wrap;line-height:1.45;color:var(--text-dim)"><strong>正文</strong><br>${contentPreview}</div>`
+                    : '';
+                statusEl.innerHTML = `<span style="color:var(--accent)">[${time}] ✍️ 接收${taskLabel}结果中${chapterLabel}${effortLabel}</span>${reasoningBlock}${contentBlock}`;
             } else if (d.status === 'received') {
-                const preview = Utils.escapeHtml(d.content || '');
-                statusEl.innerHTML = `<span style="color:var(--text-secondary)">[${time}] ✅ ${taskLabel}响应${chapterLabel}</span><br><code style="font-size:0.7rem;word-break:break-all;color:var(--text-dim)">${preview}</code>`;
+                const reasoningFallbackText = d.reasoningEffort
+                    ? (d.reasoningMode === 'none'
+                        ? '当前接口不支持推理参数，已自动降级为普通请求。'
+                        : '当前模型/接口未返回可见思维链，但请求已按推理模式发送。')
+                    : '';
+                const reasoningBlock = reasoningPreview
+                    ? `<details style="margin-top:6px"><summary style="cursor:pointer;color:#7c3aed">查看思维链 / 推理</summary><div style="margin-top:6px;white-space:pre-wrap;line-height:1.5;color:#6b4ce6">${reasoningPreview}</div></details>`
+                    : (reasoningFallbackText ? `<div style="margin-top:6px;color:var(--text-dim)">${Utils.escapeHtml(reasoningFallbackText)}</div>` : '');
+                statusEl.innerHTML = `<span style="color:var(--text-secondary)">[${time}] ✅ ${taskLabel}响应${chapterLabel}${effortLabel}${reasoningModeMeta}</span>${reasoningBlock}<code style="display:block;margin-top:6px;font-size:0.7rem;word-break:break-all;white-space:pre-wrap;color:var(--text-dim)">${contentPreview}</code>`;
             } else if (d.status === 'paused') {
                 statusEl.innerHTML = `<span style="color:#d97706">[${time}] ⏸ ${taskLabel}已暂停${chapterLabel}</span>`;
             } else if (d.status === 'error') {
@@ -1693,9 +1768,11 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
             } else if (d.status === 'cancelled') {
                 statusEl.innerHTML = `<span style="color:#dc2626">[${time}] ⏹ ${taskLabel}已取消${chapterLabel}</span>`;
             }
+
             logEl.scrollTop = logEl.scrollHeight;
         }
 
+        if (d.status === 'reasoning' || d.status === 'streaming') return;
         this._addDetailedLog(d, time);
     }
     
@@ -1710,16 +1787,37 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         const entry = document.createElement('div');
         const taskLabel = d.type === 'optimize' ? '优化' : '翻译';
         const chapterLabel = d.chapterTitle ? ` · ${Utils.escapeHtml(d.chapterTitle)}` : '';
+        const effortText = this._formatReasoningEffortLabel(d.reasoningEffort);
+        const requestedModeText = this._formatReasoningModeLabel(d.reasoningRequestedMode);
+        const finalModeText = this._formatReasoningModeLabel(d.reasoningMode);
+        const effortMeta = effortText ? `<div class="log-meta">原生推理强度：${Utils.escapeHtml(effortText)}</div>` : '';
+        const reasoningModeMeta = requestedModeText
+            ? `<div class="log-meta">推理参数：${Utils.escapeHtml(requestedModeText)}${finalModeText && finalModeText !== requestedModeText ? ` → ${Utils.escapeHtml(finalModeText)}` : ''}</div>`
+            : '';
+        const requestLabel = d.type === 'optimize'
+            ? `整章请求（${d.batch || 0}句）`
+            : `${d.batch || 0}句`;
+        const contentText = this._trimLogText(d.content || '', 2400);
+        const reasoningText = this._trimLogText(d.reasoning || '', 5000);
         entry.className = 'log-entry';
         
         if (d.status === 'requesting') {
             entry.classList.add('log-request');
-            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type req">REQ</span>${taskLabel}请求 ${d.batch || 0} 句${chapterLabel}`;
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type req">REQ</span>${taskLabel}${requestLabel}${chapterLabel}${effortMeta}${reasoningModeMeta}`;
             this._lastRequestTime = Date.now();
         } else if (d.status === 'received') {
             entry.classList.add('log-response');
             const elapsed = this._lastRequestTime ? ((Date.now() - this._lastRequestTime) / 1000).toFixed(2) : '?';
-            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type res">RES</span>${taskLabel}响应 (${elapsed}s)${chapterLabel}<div class="log-content">${Utils.escapeHtml(d.content || '')}</div>`;
+            const reasoningFallbackText = d.reasoningEffort
+                ? (d.reasoningMode === 'none'
+                    ? '当前接口不支持推理参数，已自动降级为普通请求。'
+                    : '当前模型/接口未返回可见思维链，但请求已按推理模式发送。')
+                : '';
+            const reasoningBlock = reasoningText
+                ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:#7c3aed">思维链 / 推理</summary><div class="log-content" style="margin-top:6px;color:#6b4ce6;white-space:pre-wrap;line-height:1.5">${Utils.escapeHtml(reasoningText)}</div></details>`
+                : (reasoningFallbackText ? `<div class="log-meta">${Utils.escapeHtml(reasoningFallbackText)}</div>` : '');
+            const contentBlock = contentText ? `<div class="log-content">${Utils.escapeHtml(contentText)}</div>` : '';
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type res">RES</span>${taskLabel}响应 (${elapsed}s)${chapterLabel}${effortMeta}${reasoningModeMeta}${reasoningBlock}${contentBlock}`;
         } else if (d.status === 'paused') {
             entry.classList.add('log-info');
             entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type info">PAUSE</span>${taskLabel}暂停${chapterLabel}<div class="log-meta">${Utils.escapeHtml(d.message || '等待继续')}</div>`;
@@ -2247,6 +2345,9 @@ document.getElementById('rd-content').addEventListener('scroll',()=>{
             const apiKeys = document.getElementById('api-keys').value.split('\n').map(k=>k.trim()).filter(k=>k);
             if(apiKeys.length===0){alert('请至少填写一个API密钥');return;}
             const reasoning = document.getElementById('api-reasoning').value;
+            const translationReasoningEffort = document.getElementById('api-translate-reasoning-effort').value || 'medium';
+            const optimizeReasoningEffort = document.getElementById('api-optimize-reasoning-effort').value || 'high';
+            const showReasoning = document.getElementById('api-show-reasoning').checked;
             let temperature;
             if(reasoning==='custom'){
                 temperature = parseFloat(document.getElementById('api-temp').value)||0.3;
@@ -2269,7 +2370,11 @@ document.getElementById('rd-content').addEventListener('scroll',()=>{
                 temperature,
                 maxTokens:parseInt(document.getElementById('api-max-tokens').value)||1024,
                 batchSize:parseInt(document.getElementById('batch-size').value)||30,
-                autoOptimize:document.getElementById('auto-optimize').checked
+                autoOptimize:document.getElementById('auto-optimize').checked,
+                translationReasoningEffort,
+                optimizeReasoningEffort,
+                enableReasoningTrace:showReasoning,
+                streamReasoningTrace:showReasoning
             };
             Utils.saveLocal('settings',this.settings);
             document.getElementById('modal-settings').classList.add('hidden');

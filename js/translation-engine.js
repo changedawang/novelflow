@@ -22,6 +22,10 @@ class TranslationEngine {
             translationBatchSize: Math.max(1, parseInt(config.translationBatchSize, 10) || 30),
             chapterSummaryLen: config.chapterSummaryLen || 60,  // 章节摘要长度
             globalSummaryLen: config.globalSummaryLen || 120,   // 全局摘要长度
+            enableReasoningTrace: config.enableReasoningTrace !== false,
+            streamReasoningTrace: config.streamReasoningTrace !== false,
+            translationReasoningEffort: config.translationReasoningEffort || 'medium',
+            optimizeReasoningEffort: config.optimizeReasoningEffort || 'high',
         };
 
         // 核心状态
@@ -43,6 +47,7 @@ class TranslationEngine {
         this._cancelled = false;
         this._onProgress = null; // callback(event, data)
         this._listeners = Object.create(null);
+        this._apiTraceSeq = 0;
 
     }
 
@@ -285,9 +290,14 @@ class TranslationEngine {
                 try {
                     // 动态maxTokens：按原文长度估算，最少100最多350
                     const estTokens = Math.min(350, Math.max(100, Math.ceil(sentence.length * 0.8)));
-                    const res = await this.llm.chat(messages, {
+                    const res = await this._chatWithTrace(messages, {
+                        type: 'translate',
+                        batch: 1,
+                        chapterIndex: context.chapterIndex,
                         temperature: this.config.temperature,
                         maxTokens: estTokens,
+                        reasoningEffort: this._getReasoningEffort('translate'),
+                        useStream: true
                     });
                     this.tokensInput += res.usage.prompt_tokens || 0;
                     this.tokensOutput += res.usage.completion_tokens || 0;
@@ -352,16 +362,19 @@ class TranslationEngine {
             for (let attempt = 0; attempt < 3; attempt++) {
                 await this._checkPauseCancel();
                 try {
-this._emit('apiCall', { status: 'requesting', batch: sentences.length });
-const res = await this.llm.chat(messages, {
-temperature: this.config.temperature,
-maxTokens: maxTokens,
-});
-this._emit('apiCall', { status: 'received', content: res.content.slice(0, 200) + (res.content.length > 200 ? '...' : '') });
-this.tokensInput += res.usage.prompt_tokens || 0;
-this.tokensOutput += res.usage.completion_tokens || 0;
-this._consecutiveErrors = 0;
-return this._parseBatchTranslationResponse(res.content, sentences);
+                    const res = await this._chatWithTrace(messages, {
+                        type: 'translate',
+                        batch: sentences.length,
+                        chapterIndex: context.chapterIndex,
+                        temperature: this.config.temperature,
+                        maxTokens: maxTokens,
+                        reasoningEffort: this._getReasoningEffort('translate'),
+                        useStream: true
+                    });
+                    this.tokensInput += res.usage.prompt_tokens || 0;
+                    this.tokensOutput += res.usage.completion_tokens || 0;
+                    this._consecutiveErrors = 0;
+                    return this._parseBatchTranslationResponse(res.content, sentences);
                 } catch (e) {
                     if (this._cancelled) throw new Error('CANCELLED');
                     if (this._paused || this._isRequestAbortedError(e)) {
@@ -484,7 +497,7 @@ return this._parseBatchTranslationResponse(res.content, sentences);
 
         const parts = this._buildPromptContextParts(context, sentence.length);
         parts.push(`[译] ${sentence}`);
-        parts.push('输出译文。新名词另起行:NEW_TERMS:[{"original":"","translation":"","category":""}]');
+        parts.push('先充分分析原句与上下文，再输出最终译文。不要把思考过程写进译文正文。新名词另起行:NEW_TERMS:[{"original":"","translation":"","category":""}]');
 
         return [
             { role: 'system', content: systemPrompt },
@@ -498,6 +511,7 @@ const systemPrompt = `你是专业文学翻译，遵循"信达雅"原则翻译�
 - 达：通顺流畅，符合目标语言表达习惯
 - 雅：保持原文的文学性、语气、基调
 跟随原文风格变化。遵循术语表保持一致。严格输出JSON。
+可以先充分推理，再给出最终结果，但不要把推理过程写进translation或note。
 
 【注释规则】遇到以下内容时，用note字段添加15字以内的简短注释：
 - 书名/名著（如Black Beauty→注释：英国经典儿童小说，讲述一匹马的一生）
@@ -521,6 +535,187 @@ return [
     _estimateBatchMaxTokens(sentences) {
         const totalChars = sentences.join(' ').length;
         return Math.min(1200, Math.max(220, Math.ceil(totalChars * 0.9)));
+    }
+
+    _normalizeReasoningEffort(value, fallback = 'medium') {
+        const normalized = String(value || '').trim().toLowerCase();
+        if (['low', 'medium', 'high'].includes(normalized)) return normalized;
+        if (['precise', 'minimal', 'light', 'weak'].includes(normalized)) return 'low';
+        if (['balanced', 'moderate', 'normal', 'mid'].includes(normalized)) return 'medium';
+        if (['strong', 'deep', 'extreme', 'very_high', 'max'].includes(normalized)) return 'high';
+        return fallback;
+    }
+
+    _getReasoningEffort(taskType) {
+        const fallback = taskType === 'optimize' ? 'high' : 'medium';
+        const raw = taskType === 'optimize'
+            ? this.config.optimizeReasoningEffort
+            : this.config.translationReasoningEffort;
+        return this._normalizeReasoningEffort(raw, fallback);
+    }
+
+    _estimateUsageFromText(messages, content, reasoning) {
+        const promptText = (messages || []).map(m => `[${m.role || 'user'}]\n${m.content || ''}`).join('\n\n');
+        const completionText = [reasoning || '', content || ''].filter(Boolean).join('\n');
+        const promptTokens = this.llm && this.llm.countTokens ? this.llm.countTokens(promptText) : 0;
+        const completionTokens = this.llm && this.llm.countTokens ? this.llm.countTokens(completionText) : 0;
+        return {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: promptTokens + completionTokens
+        };
+    }
+
+    async _chatWithTrace(messages, meta = {}) {
+        const {
+            type = 'translate',
+            batch = 0,
+            chapterIndex,
+            chapterTitle = '',
+            temperature = this.config.temperature,
+            maxTokens = 800,
+            reasoningEffort,
+            useStream = true
+        } = meta;
+
+        const requestId = ++this._apiTraceSeq;
+        const requestedReasoningMode = reasoningEffort ? 'effort' : 'none';
+        this._emit('apiCall', {
+            type,
+            status: 'requesting',
+            batch,
+            chapterIndex,
+            chapterTitle,
+            requestId,
+            reasoningEffort,
+            reasoningRequestedMode: requestedReasoningMode,
+            reasoningMode: requestedReasoningMode
+        });
+
+        const options = { temperature, maxTokens };
+        if (reasoningEffort) {
+            options.reasoningEffort = reasoningEffort;
+            options.reasoning = { effort: reasoningEffort };
+        }
+
+        const canStream = useStream
+            && this.config.enableReasoningTrace !== false
+            && this.config.streamReasoningTrace !== false
+            && this.llm
+            && typeof this.llm.chatStream === 'function';
+
+        if (canStream) {
+            let content = '';
+            let reasoning = '';
+            let usage = null;
+            let reasoningMeta = null;
+            let lastReasoningEmitAt = 0;
+            let lastContentEmitAt = 0;
+
+            try {
+                for await (const chunk of this.llm.chatStream(messages, options)) {
+                    if (!chunk) continue;
+
+                    if (typeof chunk === 'string') {
+                        content += chunk;
+                    } else if (chunk.type === 'meta' && chunk.reasoningMeta) {
+                        reasoningMeta = chunk.reasoningMeta;
+                        continue;
+                    } else if (chunk.type === 'usage' && chunk.usage) {
+                        usage = chunk.usage;
+                        continue;
+                    } else if (chunk.type === 'reasoning' && chunk.delta) {
+                        reasoning += chunk.delta;
+                        const now = Date.now();
+                        if (now - lastReasoningEmitAt >= 120 || /[\n。！？.!?]$/.test(chunk.delta)) {
+                            this._emit('apiCall', {
+                                type,
+                                status: 'reasoning',
+                                batch,
+                                chapterIndex,
+                                chapterTitle,
+                                requestId,
+                                reasoningEffort,
+                                reasoningPreview: reasoning.slice(-1600)
+                            });
+                            lastReasoningEmitAt = now;
+                        }
+                        continue;
+                    } else if (chunk.type === 'content' && chunk.delta) {
+                        content += chunk.delta;
+                    }
+
+                    const now = Date.now();
+                    const lastChar = content ? content.slice(-1) : '';
+                    if (content && (now - lastContentEmitAt >= 120 || /[\n}\]。！？.!?]/.test(lastChar))) {
+                        this._emit('apiCall', {
+                            type,
+                            status: 'streaming',
+                            batch,
+                            chapterIndex,
+                            chapterTitle,
+                            requestId,
+                            reasoningEffort,
+                            reasoningPreview: reasoning ? reasoning.slice(-800) : '',
+                            contentPreview: content.slice(-1200)
+                        });
+                        lastContentEmitAt = now;
+                    }
+                }
+
+                content = String(content || '').trim();
+                reasoning = String(reasoning || '').trim();
+
+                if (content) {
+                    usage = usage || this._estimateUsageFromText(messages, content, reasoning);
+                    const finalReasoningMode = reasoningMeta && reasoningMeta.finalMode ? reasoningMeta.finalMode : requestedReasoningMode;
+                    this._emit('apiCall', {
+                        type,
+                        status: 'received',
+                        batch,
+                        chapterIndex,
+                        chapterTitle,
+                        requestId,
+                        reasoningEffort,
+                        reasoningRequestedMode: reasoningMeta && reasoningMeta.requestedMode ? reasoningMeta.requestedMode : requestedReasoningMode,
+                        reasoningMode: finalReasoningMode,
+                        reasoning,
+                        content
+                    });
+                    return { content, reasoning, usage, reasoningMeta };
+                }
+            } catch (e) {
+                if (this._cancelled || this._paused || this._isRequestAbortedError(e)) {
+                    throw e;
+                }
+                console.warn('流式推理日志失败，回退普通请求:', e);
+            }
+        }
+
+        const res = await this.llm.chat(messages, options);
+        const content = String(res.content || '');
+        const reasoning = String(res.reasoning || '').trim();
+        const reasoningMeta = res.reasoningMeta || null;
+        const finalReasoningMode = reasoningMeta && reasoningMeta.finalMode ? reasoningMeta.finalMode : requestedReasoningMode;
+        this._emit('apiCall', {
+            type,
+            status: 'received',
+            batch,
+            chapterIndex,
+            chapterTitle,
+            requestId,
+            reasoningEffort,
+            reasoningRequestedMode: reasoningMeta && reasoningMeta.requestedMode ? reasoningMeta.requestedMode : requestedReasoningMode,
+            reasoningMode: finalReasoningMode,
+            reasoning,
+            content
+        });
+        return {
+            content,
+            reasoning,
+            reasoningMeta,
+            usage: res.usage || this._estimateUsageFromText(messages, content, reasoning)
+        };
     }
 
     // ── 解析翻译响应 ──
@@ -826,37 +1021,8 @@ return mapped.filter(Boolean).length === originals.length ? mapped : null;
                 sentenceCount: chapter.sentences.length
             });
 
-            // 收集章节的原文和译文
-            const pairs = chapter.sentences.map(s => ({
-                original: s.original,
-                translation: s.translation
-            }));
-
-            // 按批次优化（每批约15句，避免上下文过长）
-            const batchSize = 15;
-            const optimizedSentences = [];
-
-            for (let i = 0; i < pairs.length; i += batchSize) {
-                await this._checkPauseCancel();
-                const batch = pairs.slice(i, i + batchSize);
-                const prevContext = i > 0 ? pairs.slice(Math.max(0, i - 3), i) : [];
-                const nextContext = pairs.slice(i + batchSize, i + batchSize + 3);
-
-                const chapterSummary = this.chapterSummaries[chIdx] || '';
-const optimizedBatch = await this._optimizeBatch(batch, prevContext, nextContext, chapter.title, chapterSummary);
-                optimizedSentences.push(...optimizedBatch);
-
-                this._emit('optimizeProgress', {
-                    chapterIndex: chIdx,
-                    completed: Math.min(i + batchSize, pairs.length),
-                    total: pairs.length
-                });
-            }
-
-            optimizedResults.push({
-                ...chapter,
-                sentences: optimizedSentences
-            });
+            const optimizedChapter = await this.optimizeChapterEnhanced(chapter, chIdx);
+            optimizedResults.push(optimizedChapter);
 
             completedChapters++;
             this._emit('optimizeChapterComplete', {
@@ -910,7 +1076,7 @@ ${pairsText}${contextAfter}
         try {
             const res = await this.llm.chat([{ role: 'user', content: prompt }], {
                 temperature: 0.4,
-                max_tokens: 2000
+                maxTokens: 2000
             });
 
             this.tokensInput += res.usage.prompt_tokens || 0;
@@ -940,37 +1106,7 @@ ${pairsText}${contextAfter}
      * 优化单个章节 - 用于自动优化或手动选择章节优化
      */
     async optimizeSingleChapter(chapter, chapterIndex) {
-        if (!chapter || !chapter.sentences || chapter.sentences.length === 0) {
-            return chapter;
-        }
-        
-        const pairs = chapter.sentences.map(s => ({
-            original: s.original,
-            translation: s.translation,
-            note: s.note
-        }));
-        
-        const batchSize = 20; // 优化时可以用稍大的批次
-        const optimizedSentences = [];
-        const chapterSummary = this.chapterSummaries[chapterIndex] || '';
-        
-        for (let i = 0; i < pairs.length; i += batchSize) {
-            const batch = pairs.slice(i, i + batchSize);
-            const prevContext = i > 0 ? pairs.slice(Math.max(0, i - 3), i) : [];
-            const nextContext = pairs.slice(i + batchSize, i + batchSize + 3);
-            
-            const optimizedBatch = await this._optimizeBatchEnhanced(
-                batch, prevContext, nextContext, chapter.title, chapterSummary
-            );
-            optimizedSentences.push(...optimizedBatch);
-        }
-        
-        return {
-            ...chapter,
-            sentences: optimizedSentences,
-            optimized: true,
-            optimizedAt: Date.now()
-        };
+        return this.optimizeChapterEnhanced(chapter, chapterIndex);
     }
     
     /**
@@ -981,202 +1117,307 @@ ${pairsText}${contextAfter}
         if (!chapter || !chapter.sentences || chapter.sentences.length === 0) {
             return chapter;
         }
-        
+
         this._cancelled = false;
-        
+
         const pairs = chapter.sentences.map(s => ({
             original: s.original,
-            translation: s.translation,
+            translation: s.translation || '',
             note: s.note
         }));
-        
+
         const total = pairs.length;
-        const batchSize = 15;
-        const optimizedSentences = [];
-        
-        const prevChapterSummary = this.chapterSummaries[chapterIndex - 1] || '';
-        const currentSummary = this.chapterSummaries[chapterIndex] || chapter.summary || '';
-        const nextChapterSummary = this.chapterSummaries[chapterIndex + 1] || '';
-        const globalSummary = this.globalSummary || '';
-        
+        const startTime = Date.now();
+        const summaries = this._collectOptimizeSummaries(chapter, chapterIndex);
+
         this._emit('optimizeProgress', {
             chapterIndex,
             done: 0,
             total,
-            message: '准备优化...'
+            message: '准备整章润色...'
         });
-        
-        for (let i = 0; i < pairs.length; i += batchSize) {
-            await this._checkPauseCancel();
-            
-            const batch = pairs.slice(i, i + batchSize);
-            const prevContext = i > 0 ? pairs.slice(Math.max(0, i - 5), i) : [];
-            const nextContext = pairs.slice(i + batchSize, i + batchSize + 5);
-            const startTime = Date.now();
-            
-            const optimizedBatch = await this._optimizeBatchDeep(
-                batch,
-                prevContext,
-                nextContext,
-                chapter.title,
-                {
-                    chapterIndex,
-                    startIndex: i,
-                    total,
-                    current: currentSummary,
-                    prev: prevChapterSummary,
-                    next: nextChapterSummary,
-                    global: globalSummary
-                }
-            );
-            
-            optimizedSentences.push(...optimizedBatch);
-            this._emit('optimizeChunk', {
-                chapterIndex,
-                startIndex: i,
-                items: optimizedBatch
-            });
-            
-            const done = Math.min(i + batchSize, total);
-            this._emit('optimizeProgress', {
-                chapterIndex,
-                done,
-                total,
-                message: `优化进度: ${done}/${total}`
-            });
-            
-            this._emit('optimizeBatch', {
-                type: 'optimize',
-                chapterIndex,
-                title: chapter.title,
-                inputTokens: this._lastInputTokens || 0,
-                outputTokens: this._lastOutputTokens || 0,
-                duration: Date.now() - startTime,
-                batchSize: batch.length,
-                preview: optimizedBatch[0]?.translation?.slice(0, 80) || '',
-                done,
-                total
-            });
-        }
-        
+
+        const optimizedSentences = await this._optimizeChapterFull(
+            pairs,
+            chapter.title,
+            summaries
+        );
+
+        this._emit('optimizeChunk', {
+            chapterIndex,
+            startIndex: 0,
+            items: optimizedSentences
+        });
+
+        this._emit('optimizeProgress', {
+            chapterIndex,
+            done: total,
+            total,
+            message: `优化进度: ${total}/${total}`
+        });
+
+        this._emit('optimizeBatch', {
+            type: 'optimize',
+            chapterIndex,
+            title: chapter.title,
+            inputTokens: this._lastInputTokens || 0,
+            outputTokens: this._lastOutputTokens || 0,
+            duration: Date.now() - startTime,
+            batchSize: total,
+            preview: optimizedSentences[0]?.translation?.slice(0, 80) || '',
+            done: total,
+            total
+        });
+
         return {
             ...chapter,
-            summary: currentSummary,
+            summary: summaries.current || chapter.summary || '',
             sentences: optimizedSentences,
             optimized: true,
             optimizedAt: Date.now()
         };
     }
 
-    /**
-     * 深度批量优化 - 结合多章节摘要，使用高推理值
-     */
+    _collectOptimizeSummaries(chapter, chapterIndex) {
+        const currentSummary = String(this.chapterSummaries[chapterIndex] || chapter.summary || '').trim();
+        const chapterSummaryMap = {};
 
-    async _optimizeBatchDeep(batch, prevContext, nextContext, chapterTitle, summaries) {
+        Object.keys(this.chapterSummaries || {}).forEach(key => {
+            const idx = parseInt(key, 10);
+            if (isNaN(idx)) return;
+            const summary = String(this.chapterSummaries[key] || '').trim();
+            if (summary) chapterSummaryMap[idx] = summary;
+        });
+
+        if (currentSummary) {
+            chapterSummaryMap[chapterIndex] = currentSummary;
+        }
+
+        const chapterSummaries = Object.keys(chapterSummaryMap)
+            .map(key => parseInt(key, 10))
+            .filter(idx => !isNaN(idx))
+            .sort((a, b) => a - b)
+            .map(idx => {
+                const titleText = idx === chapterIndex && chapter.title ? `《${chapter.title}》` : '';
+                return `第${idx + 1}章${titleText}：${chapterSummaryMap[idx]}`;
+            });
+
+        return {
+            chapterIndex,
+            current: currentSummary,
+            global: String(this.globalSummary || '').trim(),
+            chapterSummaries
+        };
+    }
+
+    _parseOptimizeChapterResponse(content, pairs) {
+        const parsed = Utils.parseJSON(content);
+        let rawItems = [];
+
+        if (Array.isArray(parsed)) {
+            rawItems = parsed;
+        } else if (parsed && typeof parsed === 'object') {
+            if (Array.isArray(parsed.translations)) rawItems = parsed.translations;
+            else if (Array.isArray(parsed.items)) rawItems = parsed.items;
+            else if (Array.isArray(parsed.sentences)) rawItems = parsed.sentences;
+            else if (Array.isArray(parsed.results)) rawItems = parsed.results;
+        }
+
+        if (!Array.isArray(rawItems) || rawItems.length === 0) {
+            return null;
+        }
+
+        const mapped = new Array(pairs.length);
+
+        for (let i = 0; i < rawItems.length; i++) {
+            const item = rawItems[i];
+            let index = i + 1;
+            let translation = '';
+            let noteValue;
+            let hasExplicitNote = false;
+
+            if (typeof item === 'string') {
+                translation = item;
+            } else if (item && typeof item === 'object') {
+                const rawIndex = item.index !== undefined ? item.index : (item.id !== undefined ? item.id : item.no);
+                const parsedIndex = parseInt(rawIndex, 10);
+                if (!isNaN(parsedIndex)) index = parsedIndex;
+                translation = item.translation || item.text || item.result || item.target || item.chinese || item.content || item.final || '';
+                hasExplicitNote = Object.prototype.hasOwnProperty.call(item, 'note') ||
+                    Object.prototype.hasOwnProperty.call(item, 'annotation') ||
+                    Object.prototype.hasOwnProperty.call(item, 'comment');
+                noteValue = item.note !== undefined ? item.note : (item.annotation !== undefined ? item.annotation : item.comment);
+            }
+
+            translation = this._cleanTranslationText(translation);
+            if (!translation || index < 1 || index > pairs.length) continue;
+
+            const prev = pairs[index - 1] || {};
+            const entry = {
+                original: prev.original,
+                translation
+            };
+
+            if (hasExplicitNote) {
+                const trimmedNote = typeof noteValue === 'string' ? noteValue.trim() : '';
+                if (trimmedNote) entry.note = trimmedNote;
+                else entry.note = '';
+            } else if (prev.note && String(prev.note).trim()) {
+                entry.note = String(prev.note).trim();
+            }
+
+            mapped[index - 1] = entry;
+        }
+
+        if (mapped.filter(Boolean).length !== pairs.length) {
+            return null;
+        }
+
+        return mapped.map((item, idx) => {
+            const result = {
+                original: pairs[idx].original,
+                translation: item.translation
+            };
+            if (item.note && item.note.trim()) result.note = item.note.trim();
+            return result;
+        });
+    }
+
+    _hasMeaningfulOptimizeChange(before, after) {
+        if (!Array.isArray(before) || !Array.isArray(after) || before.length !== after.length) {
+            return false;
+        }
+
+        for (let i = 0; i < before.length; i++) {
+            const prevTranslation = this._cleanTranslationText(before[i]?.translation || '');
+            const nextTranslation = this._cleanTranslationText(after[i]?.translation || '');
+            const prevNote = String(before[i]?.note || '').trim();
+            const nextNote = String(after[i]?.note || '').trim();
+
+            if (prevTranslation !== nextTranslation || prevNote !== nextNote) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * 整章深度优化 - 输出完整润色终稿并整体替换
+     */
+    async _optimizeChapterFull(pairs, chapterTitle, summaries) {
         summaries = summaries || {};
-        const glossaryHint = this.glossary.entries.slice(0, 50)
+
+        const glossaryHint = (this.glossary.entries || [])
+            .filter(e => e && e.original && e.translation)
             .map(e => `${e.original} → ${e.translation}`)
             .join('\n');
-        
-        const styleHint = this.styleProfile 
-            ? `【文风特征】\n${this.styleProfile.style_summary || ''}\n语调: ${this.styleProfile.tone || ''}\n节奏: ${this.styleProfile.rhythm || ''}\n\n`
+
+        const styleHint = this.styleProfile
+            ? `【文风特征】\n${this.styleProfile.style_summary || ''}\n语调: ${this.styleProfile.tone || ''}\n节奏: ${this.styleProfile.rhythm || ''}\n${Array.isArray(this.styleProfile.translation_guidelines) && this.styleProfile.translation_guidelines.length ? '翻译准则: ' + this.styleProfile.translation_guidelines.join('；') + '\n' : ''}\n`
             : '';
-        
-        const contextBefore = prevContext.length > 0
-            ? '【前文语境】\n' + prevContext.map(p => `原: ${p.original}\n译: ${p.translation}`).join('\n') + '\n\n'
-            : '';
-        
-        const contextAfter = nextContext.length > 0
-            ? '\n\n【后文语境】\n' + nextContext.map(p => `原: ${p.original}\n译: ${p.translation}`).join('\n')
-            : '';
-        
-        const pairsText = batch.map((p, i) =>
-            `[${i + 1}]\n原文: ${p.original}\n当前译文: ${p.translation}${p.note ? '\n现有注释: ' + p.note : ''}`
+
+        const summarySections = [];
+        if (summaries.global) summarySections.push(`【全书摘要】\n${summaries.global}`);
+        if (Array.isArray(summaries.chapterSummaries) && summaries.chapterSummaries.length) {
+            summarySections.push(`【现有章节摘要】\n${summaries.chapterSummaries.join('\n')}`);
+        }
+        const summaryContext = summarySections.length ? summarySections.join('\n\n') + '\n\n' : '';
+
+        const pairsText = pairs.map((p, i) =>
+            `[${i + 1}]\n原文: ${p.original}\n当前译文: ${p.translation || ''}${p.note ? '\n现有注释: ' + p.note : ''}`
         ).join('\n\n');
-        
-        let summaryContext = '';
-        if (summaries.global) summaryContext += `【全书背景】${summaries.global}\n`;
-        if (summaries.prev) summaryContext += `【前章摘要】${summaries.prev}\n`;
-        if (summaries.current) summaryContext += `【本章摘要】${summaries.current}\n`;
-        if (summaries.next) summaryContext += `【后章摘要】${summaries.next}\n`;
-        if (summaryContext) summaryContext += '\n';
-        
-        const prompt = `你是资深文学翻译审校大师，精通中英文表达，擅长文学润色。现在请对以下翻译进行深度审校优化。
 
-【优化目标】
-1. 信达雅三要素：准确传意、流畅自然、文学美感
-2. 语言本土化：消除翻译腔，让读者感觉像在读原创中文小说
-3. 风格一致性：保持与全书基调、前后章节的语气连贯
+        const maxTokens = Math.max(3000, Math.min(8000, pairs.length * 100));
+        let attempt = 0;
 
-【具体要点】
-- 检查是否有漏译、误译、过度意译
-- 调整语序使更符合中文阅读习惯
-- 替换生硬词汇，使用更地道的中文表达
-- 对话要符合人物身份和情绪
-- 适当增补文化注释（典故、名著、俚语等需要note字段解释）
-- 专有名词统一使用术语表译法
-
-${chapterTitle ? '【当前章节】' + chapterTitle + '\n\n' : ''}${summaryContext}${styleHint}${glossaryHint ? '【术语表】\n' + glossaryHint + '\n\n' : ''}${contextBefore}【待优化句子】
-${pairsText}${contextAfter}
-
-【输出要求】
-仔细思考每一句，对需要修改的句子输出JSON数组：
-[{"index": 句子序号, "reason": "详细说明为什么要修改以及怎么改", "fixed": "优化后的译文", "note": "文化注释，可选"}]
-
-不需要修改的句子不要输出。如果全部满意输出 []。
-只输出JSON数组，不要任何额外说明。`;
-
-        while (true) {
+        while (attempt < 2) {
             await this._checkPauseCancel();
-            try {
-                this._emit('apiCall', {
-                    type: 'optimize',
-                    status: 'requesting',
-                    batch: batch.length,
-                    chapterIndex: summaries.chapterIndex,
-                    chapterTitle: chapterTitle || ''
-                });
 
-                const res = await this.llm.chat([{ role: 'user', content: prompt }], {
-                    temperature: 0.6,
-                    max_tokens: 3000
+            const retryHint = attempt > 0
+                ? `\n【重要补充】你上一版输出与当前译文几乎没有差异，未达到“定稿级润色”要求。本次请在忠实原意的前提下，重新逐句打磨：优先消除翻译腔，重组中文语序，调整措辞、节奏、语气和对白质感；不要整章机械照抄当前译文。`
+                : '';
+
+            const prompt = `你是资深文学翻译编辑与中文小说润色作者。请基于“原文 + 当前译文 + 全部现有摘要 + 全部现有术语”，把这一整章直接润色成可替换原译文的最终定稿。
+
+【核心目标】
+1. 严格遵循“信达雅”：忠实原意、中文自然、具有文学质感
+2. 全面消除翻译腔，让成文像成熟中文小说
+3. 保持叙事节奏、情绪基调、人物口吻与上下文一致
+4. 专有名词统一遵循术语表
+5. 对典故、名著、文化梗、俚语、双关、背景知识门槛较高处，可补充简洁注释
+
+【硬性要求】
+- 这是整章终稿，不是局部修改建议
+- 你必须输出整章所有句子的完整最终译文，顺序与输入完全一致
+- 不要解释修改理由，不要写审校说明，不要输出reason字段
+- 如某句需要注释，用 note 字段给出简洁说明，展示时会自动以“【注：...】”形式呈现
+- note 尽量简短，建议 30 字以内
+- 普通句子不要滥加注释
+- 如某句已有注释但你判断无需保留，可输出空字符串 note: ""
+- 可以充分推理，但不要把推理过程写入 translation、note 或 JSON 之外的内容
+- 除非某句确实已经无法优化，否则不要机械照抄当前译文
+- 最终输出必须是可以直接整体替换当前章节译文的定稿版本${retryHint}
+
+${chapterTitle ? `【当前章节】\n${chapterTitle}\n\n` : ''}${summaryContext}${styleHint}${glossaryHint ? `【术语表】\n${glossaryHint}\n\n` : ''}【待润色章节】
+${pairsText}
+
+【输出格式】
+只输出 JSON 对象，不要额外说明：
+{"translations":[
+  {"index":1,"translation":"润色后的最终译文","note":"可选注释"},
+  {"index":2,"translation":"润色后的最终译文"}
+]}
+
+要求：
+- translations 数量必须等于原句数量
+- index 从 1 开始，顺序与原文严格对应
+- 每一项都必须给出完整 translation
+- 不需要注释时可省略 note 字段`;
+
+            try {
+                const res = await this._chatWithTrace([{ role: 'user', content: prompt }], {
+                    type: 'optimize',
+                    batch: pairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    temperature: 0.55,
+                    maxTokens: maxTokens,
+                    reasoningEffort: this._getReasoningEffort('optimize'),
+                    useStream: true
                 });
 
                 const content = String(res.content || '');
-                this._emit('apiCall', {
-                    type: 'optimize',
-                    status: 'received',
-                    batch: batch.length,
-                    chapterIndex: summaries.chapterIndex,
-                    chapterTitle: chapterTitle || '',
-                    content: content.slice(0, 240) + (content.length > 240 ? '...' : '')
-                });
-
                 this._lastInputTokens = res.usage?.prompt_tokens || 0;
                 this._lastOutputTokens = res.usage?.completion_tokens || 0;
                 this.tokensInput += this._lastInputTokens;
                 this.tokensOutput += this._lastOutputTokens;
 
-                const parsed = Utils.parseJSON(content);
-                if (Array.isArray(parsed)) {
-                    return batch.map((p, i) => {
-                        const fix = parsed.find(x => x.index === i + 1);
-                        return {
-                            original: p.original,
-                            translation: fix && fix.fixed ? fix.fixed : p.translation,
-                            note: fix && fix.note ? fix.note : p.note,
-                            optimizeReason: fix ? fix.reason : null
-                        };
-                    });
+                const parsed = this._parseOptimizeChapterResponse(content, pairs);
+                if (parsed) {
+                    if (attempt === 0 && !this._hasMeaningfulOptimizeChange(pairs, parsed)) {
+                        attempt++;
+                        continue;
+                    }
+                    return parsed;
                 }
 
-                return batch.map(p => ({ original: p.original, translation: p.translation, note: p.note }));
+                if (attempt === 0) {
+                    attempt++;
+                    continue;
+                }
+
+                return pairs.map(p => ({
+                    original: p.original,
+                    translation: p.translation || '',
+                    ...(p.note && String(p.note).trim() ? { note: String(p.note).trim() } : {})
+                }));
             } catch (e) {
                 if (this._cancelled) {
                     this._emit('apiCall', {
                         type: 'optimize',
                         status: 'cancelled',
-                        batch: batch.length,
+                        batch: pairs.length,
                         chapterIndex: summaries.chapterIndex,
                         chapterTitle: chapterTitle || '',
                         message: '优化已取消'
@@ -1187,7 +1428,7 @@ ${pairsText}${contextAfter}
                     this._emit('apiCall', {
                         type: 'optimize',
                         status: 'paused',
-                        batch: batch.length,
+                        batch: pairs.length,
                         chapterIndex: summaries.chapterIndex,
                         chapterTitle: chapterTitle || '',
                         message: '优化已暂停'
@@ -1198,15 +1439,31 @@ ${pairsText}${contextAfter}
                 this._emit('apiCall', {
                     type: 'optimize',
                     status: 'error',
-                    batch: batch.length,
+                    batch: pairs.length,
                     chapterIndex: summaries.chapterIndex,
                     chapterTitle: chapterTitle || '',
                     message: e.message || '未知错误'
                 });
-                console.warn('深度优化失败，保留原译文:', e);
-                return batch.map(p => ({ original: p.original, translation: p.translation, note: p.note }));
+                console.warn('整章优化失败，保留原译文:', e);
+
+                if (attempt === 0) {
+                    attempt++;
+                    continue;
+                }
+
+                return pairs.map(p => ({
+                    original: p.original,
+                    translation: p.translation || '',
+                    ...(p.note && String(p.note).trim() ? { note: String(p.note).trim() } : {})
+                }));
             }
         }
+
+        return pairs.map(p => ({
+            original: p.original,
+            translation: p.translation || '',
+            ...(p.note && String(p.note).trim() ? { note: String(p.note).trim() } : {})
+        }));
     }
 
     /**
@@ -1263,7 +1520,7 @@ ${pairsText}${contextAfter}
         try {
             const res = await this.llm.chat([{ role: 'user', content: prompt }], {
                 temperature: 0.35,
-                max_tokens: 2500
+                maxTokens: 2500
             });
             
             this.tokensInput += res.usage.prompt_tokens || 0;
