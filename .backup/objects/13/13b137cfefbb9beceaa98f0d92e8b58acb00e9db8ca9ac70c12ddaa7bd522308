@@ -635,12 +635,8 @@ this._showPage('work');
         if(!book) return;
         switch(ev) {
             case 'phase':
-            document.getElementById('ws-phase').textContent = d.message||d.phase;
-            // 记录关键phase变化到日志
-            if (d.phase === 'retrying' || d.phase === 'glossary' || d.phase === 'style') {
-                this._addInfoLog(d.message || d.phase);
-            }
-            break;
+                document.getElementById('ws-phase').textContent = d.message||d.phase;
+                break;
             case 'sentenceComplete': {
                 const pos = this._resolveGlobalPosition(d.chapterIndex, d.sentenceIndex);
                 const total = book.total || this.chapters.reduce((sum, ch) => sum + (((ch && ch.sentences) ? ch.sentences.length : 0)), 0);
@@ -708,7 +704,6 @@ this._showPage('work');
             case 'error':
                 this._setDot('error');
                 document.getElementById('ws-detail').textContent = d.message||'';
-                this._addDetailedLog({ status: 'error', message: d.message, attempt: d.attempt, maxAttempts: d.maxAttempts }, new Date().toLocaleTimeString());
                 break;
         }
     }
@@ -1693,8 +1688,6 @@ document.getElementById('rd-content').addEventListener('scroll',()=>{
             Utils.saveLocal('settings',this.settings);
             document.getElementById('modal-settings').classList.add('hidden');
         });
-        // 清空日志
-        document.getElementById('btn-clear-logs').addEventListener('click',()=>this._clearLogs());
         // 添加术语
         document.getElementById('btn-add-term').addEventListener('click',()=>document.getElementById('modal-add-term').classList.remove('hidden'));
         document.getElementById('btn-confirm-term').addEventListener('click',()=>{

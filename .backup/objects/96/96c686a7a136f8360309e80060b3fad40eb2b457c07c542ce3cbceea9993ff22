@@ -635,12 +635,8 @@ this._showPage('work');
         if(!book) return;
         switch(ev) {
             case 'phase':
-            document.getElementById('ws-phase').textContent = d.message||d.phase;
-            // 记录关键phase变化到日志
-            if (d.phase === 'retrying' || d.phase === 'glossary' || d.phase === 'style') {
-                this._addInfoLog(d.message || d.phase);
-            }
-            break;
+                document.getElementById('ws-phase').textContent = d.message||d.phase;
+                break;
             case 'sentenceComplete': {
                 const pos = this._resolveGlobalPosition(d.chapterIndex, d.sentenceIndex);
                 const total = book.total || this.chapters.reduce((sum, ch) => sum + (((ch && ch.sentences) ? ch.sentences.length : 0)), 0);

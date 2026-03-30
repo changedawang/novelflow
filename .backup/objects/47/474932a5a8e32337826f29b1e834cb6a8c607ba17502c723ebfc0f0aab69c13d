@@ -240,24 +240,12 @@
             </div>
 
             <!-- Panel: 摘要 -->
-<div class="wpanel" id="panel-summary">
-<div class="panel-content" id="summary-content">
-<div class="panel-empty">📋 翻译进行中将自动生成摘要...</div>
-</div>
-</div>
-
-<!-- Panel: 日志 -->
-<div class="wpanel" id="panel-logs">
-<div class="logs-toolbar">
-<button class="btn-paper btn-sm" id="btn-clear-logs">🗑️ 清空</button>
-<label><input type="checkbox" id="log-auto-scroll" checked> 自动滚动</label>
-<span class="log-stats" id="log-stats">0 条日志</span>
-</div>
-<div class="logs-container" id="logs-container">
-<div class="panel-empty" id="logs-empty">🔍 翻译开始后将显示API调用日志...</div>
-</div>
-</div>
-</section>
+            <div class="wpanel" id="panel-summary">
+                <div class="panel-content" id="summary-content">
+                    <div class="panel-empty">📋 翻译进行中将自动生成摘要...</div>
+                </div>
+            </div>
+        </section>
 
         <!-- ══ 页面5: 沉浸式阅读器 ══ -->
         <section class="page page-reader hidden" id="page-reader" data-theme="light">
