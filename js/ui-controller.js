@@ -1,5 +1,6 @@
 /* NovelFlow — UI Controller v4 书架版 */
 class UIController {
+
     constructor() {
         this.pages = { shelf:'page-shelf', upload:'page-upload', config:'page-config', work:'page-work', reader:'page-reader' };
         this.currentPage = 'shelf';
@@ -14,6 +15,15 @@ class UIController {
         this._progressOffset = 0;
         this._summaryChapterOffset = 0;
         this._engineRunId = 0;
+        this._isOptimizeMode = false;
+        this._optimizing = false;
+        this._optimizePaused = false;
+        this._optimizeQueue = [];
+        this._optimizeCurrentIdx = 0;
+        this._optimizeBookId = null;
+        this._optimizeResumeResolve = null;
+        this._optimizeReturnChIdx = null;
+        this._logCount = 0;
         this._init();
     }
 
@@ -651,9 +661,11 @@ this._showPage('work');
             case 'phase':
             document.getElementById('ws-phase').textContent = d.message||d.phase;
             // 记录关键phase变化到日志
-            if (d.phase === 'retrying' || d.phase === 'glossary' || d.phase === 'style') {
+
+            if (['retrying', 'glossary', 'style', 'paused', 'resuming'].includes(d.phase)) {
                 this._addInfoLog(d.message || d.phase);
             }
+
             break;
             case 'sentenceComplete': {
                 const pos = this._resolveGlobalPosition(d.chapterIndex, d.sentenceIndex);
@@ -783,50 +795,24 @@ this._showPage('work');
     _bindOptimize() {
         const btnOptimize = document.getElementById('btn-optimize');
         const btnCancelOpt = document.getElementById('btn-cancel-optimize');
-        const optBar = document.getElementById('optimize-bar');
         if (!btnOptimize) return;
 
         btnOptimize.onclick = async () => {
-            if (!this.translationResults || this.translationResults.length === 0) {
-                alert('没有可优化的翻译结果');
+            const book = this._getBook(this.currentBookId);
+            if (!book) {
+                alert('没有找到当前书籍');
                 return;
             }
-            btnOptimize.disabled = true;
-            btnOptimize.textContent = '优化中...';
-            optBar.classList.add('show');
-            optBar.querySelector('.optimize-fill').style.width = '0%';
-            this._optimizing = true;
-
-            try {
-                await this.engine.optimizeTranslation(this.translationResults, (done, total) => {
-                    if (!this._optimizing) return;
-                    const pct = Math.round(done / total * 100);
-                    optBar.querySelector('.optimize-fill').style.width = pct + '%';
-                    optBar.querySelector('.optimize-label').textContent = `优化中 ${done}/${total}`;
-                });
-                if (this._optimizing) {
-                    this._saveProgress(null);
-                    this._renderLiveContent();
-                    alert('优化完成！');
-                }
-            } catch (e) {
-                console.error('优化失败', e);
-                alert('优化失败: ' + e.message);
-            } finally {
-                this._optimizing = false;
-                btnOptimize.disabled = false;
-                btnOptimize.textContent = '✨ 优化翻译';
-                optBar.classList.remove('show');
-            }
+            this._rdBook = book;
+            if (!Number.isInteger(this._rdChIdx)) this._rdChIdx = 0;
+            await this._startReaderOptimize();
         };
 
         if (btnCancelOpt) {
-            btnCancelOpt.onclick = () => {
-                this._optimizing = false;
-            };
+            btnCancelOpt.onclick = () => this._cancelOptimize();
         }
     }
-    
+
     // 自动优化单个章节（翻译完成后自动触发）
     async _autoOptimizeChapter(chapterIndex) {
         const book = this._getBook(this.currentBookId);
@@ -853,160 +839,365 @@ this._showPage('work');
             this._optimizing = false;
         }
     }
-    
+
+    _ensureOptimizeSelectModal() {
+        let modal = document.getElementById('modal-optimize-select');
+        if (modal) return modal;
+
+        modal = document.createElement('div');
+        modal.id = 'modal-optimize-select';
+        modal.className = 'modal-bg hidden';
+        modal.innerHTML = `
+            <div class="modal-card">
+                <div class="modal-head">
+                    <h3>✨ 选择要优化的章节</h3>
+                    <button class="modal-close" type="button">✕</button>
+                </div>
+                <div class="modal-body">
+                    <p style="margin:0 0 10px;color:var(--text-dim);font-size:.82rem">可多选，默认选中当前阅读章节。</p>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+                        <button class="btn-paper btn-sm" type="button" data-action="current">当前章</button>
+                        <button class="btn-paper btn-sm" type="button" data-action="all">全选</button>
+                        <button class="btn-paper btn-sm" type="button" data-action="invert">反选</button>
+                    </div>
+                    <div id="optimize-chapter-list" style="max-height:50vh;overflow:auto;border:1px solid var(--border-light);border-radius:var(--r-md);background:var(--paper-light);padding:8px 10px"></div>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn-paper" type="button" data-action="cancel">取消</button>
+                    <button class="btn-paper btn-accent" type="button" data-action="confirm">开始优化</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        return modal;
+    }
+
+    _pickOptimizeChapters(translatedChapters, currentIdx) {
+        const modal = this._ensureOptimizeSelectModal();
+        const list = modal.querySelector('#optimize-chapter-list');
+        list.innerHTML = translatedChapters.map(ch => `
+            <label style="display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid var(--border-light);cursor:pointer">
+                <input type="checkbox" value="${ch.idx}" ${ch.idx === currentIdx ? 'checked' : ''}>
+                <span style="flex:1">${Utils.escapeHtml(ch.title)}</span>
+                <span style="font-size:.75rem;color:var(--text-dim)">${ch.translatedCount}/${ch.total}句</span>
+            </label>
+        `).join('');
+
+        return new Promise(resolve => {
+            const close = (result) => {
+                modal.classList.add('hidden');
+                modal.onclick = null;
+                modal.querySelector('.modal-close').onclick = null;
+                modal.querySelector('[data-action="cancel"]').onclick = null;
+                modal.querySelector('[data-action="confirm"]').onclick = null;
+                modal.querySelector('[data-action="current"]').onclick = null;
+                modal.querySelector('[data-action="all"]').onclick = null;
+                modal.querySelector('[data-action="invert"]').onclick = null;
+                resolve(result);
+            };
+            const getBoxes = () => Array.from(list.querySelectorAll('input[type="checkbox"]'));
+
+            modal.querySelector('.modal-close').onclick = () => close(null);
+            modal.querySelector('[data-action="cancel"]').onclick = () => close(null);
+            modal.querySelector('[data-action="current"]').onclick = () => {
+                getBoxes().forEach(box => { box.checked = Number(box.value) === currentIdx; });
+            };
+            modal.querySelector('[data-action="all"]').onclick = () => {
+                getBoxes().forEach(box => { box.checked = true; });
+            };
+            modal.querySelector('[data-action="invert"]').onclick = () => {
+                getBoxes().forEach(box => { box.checked = !box.checked; });
+            };
+            modal.querySelector('[data-action="confirm"]').onclick = () => {
+                const selected = getBoxes()
+                    .filter(box => box.checked)
+                    .map(box => Number(box.value))
+                    .sort((a, b) => a - b);
+                if (!selected.length) {
+                    alert('至少选择一章');
+                    return;
+                }
+                close(selected);
+            };
+            modal.onclick = (e) => {
+                if (e.target === modal) close(null);
+            };
+            modal.classList.remove('hidden');
+        });
+    }
+
+    _renderOptimizeCompareChapter(chapterIndex) {
+        const sourceChapter = this.chapters && this.chapters[chapterIndex];
+        if (!sourceChapter || !Array.isArray(sourceChapter.sentences)) return;
+
+        const liveSelect = document.getElementById('live-chapter-select');
+        if (liveSelect) liveSelect.value = String(chapterIndex);
+
+        const translatedChapter = this.translationResults[chapterIndex] || { sentences: [] };
+        const translatedSentences = translatedChapter.sentences || [];
+        const srcList = document.getElementById('src-list');
+        const tgtList = document.getElementById('tgt-list');
+        if (!srcList || !tgtList) return;
+
+        const prevAutoScroll = this._autoScroll;
+        this._autoScroll = false;
+        srcList.innerHTML = '';
+        tgtList.innerHTML = '';
+        this._workRows = [];
+
+        for (let sentIdx = 0; sentIdx < sourceChapter.sentences.length; sentIdx++) {
+            const source = sourceChapter.sentences[sentIdx];
+            const existing = translatedSentences[sentIdx];
+            this._addSentRow(source, existing ? existing.translation : '', existing ? existing.failed : false, sentIdx);
+        }
+
+        this._autoScroll = prevAutoScroll;
+        srcList.scrollTop = 0;
+        tgtList.scrollTop = 0;
+    }
+
+    _applyOptimizeChunk(d) {
+        if (!d || typeof d.chapterIndex !== 'number' || !Array.isArray(d.items)) return;
+        const startIndex = Number(d.startIndex) || 0;
+        const chapter = this._ensureResultChapter(d.chapterIndex);
+
+        d.items.forEach((item, offset) => {
+            chapter.sentences[startIndex + offset] = item;
+        });
+        this.translationResults[d.chapterIndex] = chapter;
+
+        const compareChIdx = this._isOptimizeMode
+            ? this._optimizeQueue[this._optimizeCurrentIdx]
+            : this._liveChIdx;
+
+        if (compareChIdx === d.chapterIndex) {
+            d.items.forEach((item, offset) => {
+                const sentIndex = startIndex + offset;
+                const source = this.chapters[d.chapterIndex]?.sentences?.[sentIndex] || item.original || '';
+                this._addSentRow(source, item.translation || '', !!item.failed, sentIndex);
+            });
+        }
+
+        this._updateLiveReaderOnProgress();
+    }
+
     async _startReaderOptimize() {
-        const book = this._rdBook;
-        if (!book) {
+        if (this._optimizing) {
+            alert('当前已有优化任务正在进行');
+            return;
+        }
+
+        const latestBook = this._getBook(this.currentBookId) || this._rdBook;
+        if (!latestBook) {
             alert('请先打开一本书');
             return;
         }
-        
-        // 获取已翻译的章节列表
-        const results = book.results || [];
+
+        if (!this.settings.apiKeys || this.settings.apiKeys.length === 0) {
+            alert('请先在设置中填写API密钥');
+            this._openSettingsModal();
+            return;
+        }
+
+        const model = this._ensureSettingsModel();
+        if (!model) {
+            alert('请先填写模型名，或点击“获取模型”选择一个可用模型');
+            this._openSettingsModal();
+            return;
+        }
+
+        const chapters = Utils.loadLocal(`chapters-${latestBook.id}`, latestBook.chapters || []);
+        const results = Utils.loadLocal(`results-${latestBook.id}`, latestBook.results || []);
+        const book = Object.assign({}, latestBook, { chapters, results });
+
         const translatedChapters = [];
-        for (let i = 0; i < (book.chapters || []).length; i++) {
-            const r = results[i];
-            if (r && r.sentences && r.sentences.some(s => s && s.translation)) {
-                translatedChapters.push({ idx: i, title: r.title || book.chapters[i]?.title || `第${i+1}章` });
+        for (let i = 0; i < chapters.length; i++) {
+            const sourceChapter = chapters[i];
+            const resultChapter = results[i];
+            const translatedCount = Array.isArray(resultChapter?.sentences)
+                ? resultChapter.sentences.filter(s => s && s.translation).length
+                : 0;
+            if (sourceChapter && translatedCount > 0) {
+                translatedChapters.push({
+                    idx: i,
+                    title: resultChapter?.title || sourceChapter.title || `第${i + 1}章`,
+                    translatedCount,
+                    total: Array.isArray(sourceChapter.sentences) ? sourceChapter.sentences.length : translatedCount
+                });
             }
         }
-        
+
         if (translatedChapters.length === 0) {
             alert('没有可优化的翻译结果，请先翻译');
             return;
         }
-        
-        // 当前章节
-        const currentIdx = this._rdChIdx;
-        const currentInList = translatedChapters.find(c => c.idx === currentIdx);
-        
-        // 弹窗选择要优化的章节
+
+        const currentIdx = translatedChapters.some(ch => ch.idx === this._rdChIdx)
+            ? this._rdChIdx
+            : translatedChapters[0].idx;
+
         let selectedChapters = [currentIdx];
         if (translatedChapters.length > 1) {
-            const options = translatedChapters.map(c => 
-                `${c.idx === currentIdx ? '● ' : '○ '}${c.title}`
-            ).join('\n');
-            const msg = `已翻译章节：\n${options}\n\n当前将优化：${currentInList ? currentInList.title : `第${currentIdx+1}章`}\n\n点击确定开始优化`;
-            if (!confirm(msg)) return;
-        } else {
-            if (!confirm(`优化 ${translatedChapters[0].title}？`)) return;
-            selectedChapters = [translatedChapters[0].idx];
+            const picked = await this._pickOptimizeChapters(translatedChapters, currentIdx);
+            if (!picked || picked.length === 0) return;
+            selectedChapters = picked;
         }
-        
-        // 设置优化状态
+
         this._isOptimizeMode = true;
-        this._optimizeQueue = selectedChapters;
+        this._optimizing = true;
+        this._optimizePaused = false;
+        this._optimizeQueue = [...selectedChapters];
         this._optimizeCurrentIdx = 0;
         this._optimizeBookId = book.id;
+        this._optimizeReturnChIdx = currentIdx;
         this._wasTranslating = (book.status === 'translating' || book.status === 'paused');
-        
-        // 加载数据
+
         this.currentBookId = book.id;
         this.fileName = book.fileName;
-        this.chapters = book.chapters || [];
-        this.translationResults = this._cloneResults(book.results || []);
-        
-        // 切换到工作台
+        this.chapters = chapters;
+        this.translationResults = this._cloneResults(results);
+        this._rdBook = book;
+
         this._showPage('work');
-        this._activateWorkTab('compare'); // 切换到对照面板
+        this._activateWorkTab('translation');
         this._liveChIdx = selectedChapters[0];
         this._initLiveReader();
-        
-        // 更新UI
-        const firstChTitle = this.chapters[selectedChapters[0]]?.title || `第${selectedChapters[0]+1}章`;
-        document.getElementById('ws-filename').textContent = book.fileName;
+        this._renderOptimizeCompareChapter(selectedChapters[0]);
+        this._clearLogs();
+
+        const firstChTitle = this.chapters[selectedChapters[0]]?.title || `第${selectedChapters[0] + 1}章`;
+        const workTitleEl = document.getElementById('work-title');
+        if (workTitleEl) workTitleEl.textContent = `✨ 优化中 · ${book.fileName}`;
+        document.getElementById('done-banner').classList.add('hidden');
+        document.getElementById('optimize-bar').classList.remove('show');
         document.getElementById('ws-phase').textContent = '✨ 优化中';
-        document.getElementById('ws-detail').textContent = `正在优化 ${firstChTitle}`;
+        document.getElementById('ws-detail').textContent = `正在优化 ${firstChTitle} (1/${selectedChapters.length})`;
         document.getElementById('ws-tokens').textContent = '0 tokens';
         document.getElementById('progress-bar').style.width = '0%';
         document.getElementById('prog-label').textContent = '0/0';
         document.getElementById('prog-pct').textContent = '0%';
-        document.getElementById('pause-bar').classList.add('show');
         document.getElementById('btn-pause').textContent = '⏸ 暂停优化';
         document.getElementById('btn-pause').disabled = false;
         document.getElementById('btn-cancel').textContent = '✕ 取消优化';
-        this._setDot('translating');
-        
-        // 添加日志
-        this._addInfoLog(`🎯 开始优化任务`);
-        this._addInfoLog(`📚 共 ${selectedChapters.length} 章待优化`);
-        
-        // 初始化引擎
+        const pauseBar = document.getElementById('pause-bar');
+        const pauseLabel = pauseBar ? pauseBar.querySelector('span') : null;
+        if (pauseBar) pauseBar.classList.remove('show');
+        if (pauseLabel) pauseLabel.textContent = '⚠️ 优化已暂停';
+        this._setDot('active');
+
+        this._addInfoLog('🎯 开始优化任务');
+        this._addInfoLog(`📚 已选择 ${selectedChapters.length} 章待优化`);
+        this._addInfoLog(`📝 对照面板已加载：${firstChTitle}`);
+
         const s = this.settings;
         this.engine = new TranslationEngine({
-            api: { apiKeys: s.apiKeys, model: s.model, baseUrl: s.baseUrl, provider: s.provider },
+            api: { apiKeys: s.apiKeys, model, baseUrl: s.baseUrl, provider: s.provider },
             targetLang: book.targetLang || '简体中文',
         });
         if (book.glossary) this.engine.glossary.fromJSON(book.glossary);
         if (book.styleProfile) this.engine.styleProfile = book.styleProfile;
         this.engine.chapterSummaries = book.chapterSummaries || {};
         this.engine.globalSummary = book.globalSummary || '';
-        
-        // 绑定事件
-        this._optimizing = true;
-        this._optimizePaused = false;
+
         this.engine.on('optimizeProgress', (d) => this._onOptimizeProgress(d));
         this.engine.on('optimizeBatch', (d) => this._onOptimizeBatch(d));
-        
-        // 绑定按钮
-        document.getElementById('btn-pause').onclick = () => this._toggleOptimizePause();
-        document.getElementById('btn-cancel').onclick = () => this._cancelOptimize();
-        
-        // 开始优化队列
+        this.engine.on('optimizeChunk', (d) => this._applyOptimizeChunk(d));
+        this.engine.on('apiCall', (d) => this._updateApiLog(d));
+
         await this._processOptimizeQueue(book);
     }
-    
+
     async _processOptimizeQueue(book) {
         while (this._optimizeCurrentIdx < this._optimizeQueue.length && this._optimizing) {
-            // 检查暂停
             if (this._optimizePaused) {
+                const pausedChIdx = this._optimizeQueue[this._optimizeCurrentIdx];
+                const pausedChTitle = Number.isInteger(pausedChIdx)
+                    ? (this.translationResults[pausedChIdx]?.title || this.chapters[pausedChIdx]?.title || `第${pausedChIdx + 1}章`)
+                    : '';
+
+                this._setDot('paused');
                 document.getElementById('ws-phase').textContent = '⏸ 优化已暂停';
-                this._addInfoLog('⏸ 优化已暂停，等待继续...');
+                document.getElementById('ws-detail').textContent = pausedChTitle
+                    ? `优化暂停中：${pausedChTitle}，不再发送新请求`
+                    : '优化暂停中，不再发送新请求';
                 await this._waitForOptimizeResume();
                 if (!this._optimizing) break;
-                this._addInfoLog('▶ 继续优化');
             }
-            
+
             const chIdx = this._optimizeQueue[this._optimizeCurrentIdx];
-            const chapter = this.translationResults[chIdx];
-            const chTitle = chapter?.title || this.chapters[chIdx]?.title || `第${chIdx+1}章`;
-            
-            // 更新UI
+            const chapter = this._ensureResultChapter(chIdx);
+            chapter.chapterIndex = chIdx;
+            if (!chapter.title) chapter.title = this.chapters[chIdx]?.title || `第${chIdx + 1}章`;
+            if (!Array.isArray(chapter.sentences)) chapter.sentences = [];
+
+            const chTitle = chapter.title || this.chapters[chIdx]?.title || `第${chIdx + 1}章`;
+            const sourceChapter = this.chapters[chIdx];
+            const totalSent = Array.isArray(sourceChapter?.sentences)
+                ? sourceChapter.sentences.length
+                : (chapter.sentences?.length || 0);
+
+            if (totalSent === 0) {
+                this._addInfoLog(`⏭ 跳过空章节：${chTitle}`);
+                this._optimizeCurrentIdx++;
+                continue;
+            }
+
             this._liveChIdx = chIdx;
+            this._renderOptimizeCompareChapter(chIdx);
             this._renderLiveContent();
+            this._setDot('active');
             document.getElementById('ws-phase').textContent = '✨ 优化中';
-            document.getElementById('ws-detail').textContent = `正在优化 ${chTitle} (${this._optimizeCurrentIdx+1}/${this._optimizeQueue.length})`;
+            document.getElementById('ws-detail').textContent = `正在优化 ${chTitle} (${this._optimizeCurrentIdx + 1}/${this._optimizeQueue.length})`;
             this._addInfoLog(`📖 开始优化: ${chTitle}`);
-            
-            const totalSent = chapter?.sentences?.length || 0;
+
+            document.getElementById('progress-bar').style.width = '0%';
             document.getElementById('prog-label').textContent = `0/${totalSent}`;
-            
+            document.getElementById('prog-pct').textContent = '0%';
+
             try {
                 const optimized = await this.engine.optimizeChapterEnhanced(chapter, chIdx);
-                if (this._optimizing && optimized) {
-                    // 更新结果
-                    this.translationResults[chIdx] = optimized;
-                    if (!book.results) book.results = [];
-                    book.results[chIdx] = optimized;
+                if (!this._optimizing) break;
+
+                if (optimized) {
+                    const savedChapter = {
+                        ...chapter,
+                        ...optimized,
+                        chapterIndex: chIdx,
+                        title: optimized.title || chapter.title || this.chapters[chIdx]?.title || `第${chIdx + 1}章`,
+                        summary: optimized.summary || chapter.summary || '',
+                        sentences: Array.isArray(optimized.sentences) ? optimized.sentences : (chapter.sentences || []),
+                        optimized: true,
+                        optimizedAt: optimized.optimizedAt || Date.now()
+                    };
+
+                    this.translationResults[chIdx] = savedChapter;
+                    if (!Array.isArray(book.results)) book.results = [];
+                    book.results[chIdx] = JSON.parse(JSON.stringify(savedChapter));
+                    book.updatedAt = Date.now();
+
                     Utils.saveLocal(`results-${book.id}`, book.results);
                     this._saveBook(book);
+                    this._rdBook = book;
+
+                    this._renderOptimizeCompareChapter(chIdx);
                     this._renderLiveContent();
-                    this._addInfoLog(`✅ ${chTitle} 优化完成！`);
+                    this._addInfoLog(`✅ ${chTitle} 优化完成`);
+                    document.getElementById('ws-detail').textContent = `${chTitle} 优化完成 (${this._optimizeCurrentIdx + 1}/${this._optimizeQueue.length})`;
                 }
             } catch (e) {
-                if (this._optimizing) {
-                    this._addInfoLog(`❌ ${chTitle} 优化失败: ${e.message}`);
-                }
+                if (!this._optimizing || e?.message === 'CANCELLED') break;
+                this._addInfoLog(`❌ ${chTitle} 优化失败: ${e.message || '未知错误'}`);
+                document.getElementById('ws-detail').textContent = `${chTitle} 优化失败，继续下一章`;
             }
-            
+
             this._optimizeCurrentIdx++;
         }
-        
+
         if (this._optimizing) {
-            this._addInfoLog(`🎉 所有章节优化完成！`);
+            this._addInfoLog('🎉 所有章节优化完成');
             document.getElementById('ws-phase').textContent = '✨ 优化完成';
-            document.getElementById('ws-detail').textContent = '即将返回阅读器...';
-            setTimeout(() => this._finishOptimize(true), 1500);
+            document.getElementById('ws-detail').textContent = '正在返回阅读器...';
+            setTimeout(() => this._finishOptimize(true), 600);
         }
     }
     
@@ -1017,47 +1208,83 @@ this._showPage('work');
     }
     
     _toggleOptimizePause() {
+        if (!this._optimizing) return;
+
+        const currentChIdx = this._optimizeQueue[this._optimizeCurrentIdx];
+        const currentChTitle = Number.isInteger(currentChIdx)
+            ? (this.translationResults[currentChIdx]?.title || this.chapters[currentChIdx]?.title || `第${currentChIdx + 1}章`)
+            : '';
+
+        const pauseBar = document.getElementById('pause-bar');
+        const pauseLabel = pauseBar ? pauseBar.querySelector('span') : null;
+
         if (this._optimizePaused) {
-            // 继续
             this._optimizePaused = false;
+            if (this.engine) this.engine.resume();
             document.getElementById('btn-pause').textContent = '⏸ 暂停优化';
             document.getElementById('ws-phase').textContent = '✨ 优化中';
+            document.getElementById('ws-detail').textContent = currentChTitle ? `继续优化 ${currentChTitle}` : '继续发送优化请求';
+            if (pauseBar) pauseBar.classList.remove('show');
+            this._setDot('active');
+            this._addInfoLog(currentChTitle ? `▶ 继续优化：${currentChTitle}` : '▶ 继续优化');
             if (this._optimizeResumeResolve) {
                 this._optimizeResumeResolve();
                 this._optimizeResumeResolve = null;
             }
         } else {
-            // 暂停
             this._optimizePaused = true;
+            if (this.engine) this.engine.pause();
             document.getElementById('btn-pause').textContent = '▶ 继续优化';
             document.getElementById('ws-phase').textContent = '⏸ 优化已暂停';
-            this._addInfoLog('⏸ 用户暂停优化');
-            if (this.engine) this.engine.cancel();
+            document.getElementById('ws-detail').textContent = currentChTitle
+                ? `优化暂停中：${currentChTitle}，不再发送新请求`
+                : '优化暂停中，不再发送新请求';
+            if (pauseLabel) pauseLabel.textContent = '⚠️ 优化已暂停';
+            if (pauseBar) pauseBar.classList.add('show');
+            this._setDot('paused');
+            this._updateApiLog({
+                type: 'optimize',
+                status: 'paused',
+                chapterIndex: currentChIdx,
+                chapterTitle: currentChTitle,
+                message: currentChTitle ? `用户手动暂停：${currentChTitle}` : '用户手动暂停优化'
+            });
+            this._addInfoLog(currentChTitle ? `⏸ 用户暂停优化：${currentChTitle}` : '⏸ 用户暂停优化');
         }
     }
     
     _onOptimizeProgress(d) {
-        const pct = d.total > 0 ? Math.round(d.done / d.total * 100) : 0;
+        if (!this._isOptimizeMode) return;
+
+        const done = typeof d.done === 'number' ? d.done : (typeof d.completed === 'number' ? d.completed : 0);
+        const total = typeof d.total === 'number' ? d.total : 0;
+        const pct = total > 0 ? Math.round(done / total * 100) : 0;
         document.getElementById('progress-bar').style.width = pct + '%';
-        document.getElementById('prog-label').textContent = `${d.done}/${d.total}`;
+        document.getElementById('prog-label').textContent = `${done}/${total}`;
         document.getElementById('prog-pct').textContent = pct + '%';
+
+        if (typeof d.chapterIndex === 'number') {
+            const qPos = this._optimizeQueue.indexOf(d.chapterIndex);
+            const chTitle = this.translationResults[d.chapterIndex]?.title || this.chapters[d.chapterIndex]?.title || `第${d.chapterIndex + 1}章`;
+            const qText = qPos >= 0 ? ` (${qPos + 1}/${this._optimizeQueue.length})` : '';
+            document.getElementById('ws-detail').textContent = `正在优化 ${chTitle}${qText} · ${done}/${total}`;
+        }
     }
     
     _onOptimizeBatch(d) {
-        this._addAPILog({
-            type: 'optimize',
-            inputTokens: d.inputTokens || 0,
-            outputTokens: d.outputTokens || 0,
-            duration: d.duration || 0,
-            batchSize: d.batchSize || 0,
-            response: d.preview || ''
-        });
+        if (!this._isOptimizeMode) return;
         const totalTokens = (this.engine?.tokensInput || 0) + (this.engine?.tokensOutput || 0);
         document.getElementById('ws-tokens').textContent = Utils.formatNumber(totalTokens) + ' tokens';
     }
     
     _cancelOptimize() {
         if (!this._optimizing) return;
+
+        const currentChIdx = this._optimizeQueue[this._optimizeCurrentIdx];
+        const currentChTitle = Number.isInteger(currentChIdx)
+            ? (this.translationResults[currentChIdx]?.title || this.chapters[currentChIdx]?.title || `第${currentChIdx + 1}章`)
+            : '';
+
         this._optimizing = false;
         this._optimizePaused = false;
         if (this.engine) this.engine.cancel();
@@ -1065,46 +1292,81 @@ this._showPage('work');
             this._optimizeResumeResolve();
             this._optimizeResumeResolve = null;
         }
-        this._addInfoLog('⏹ 优化已取消');
+
+        const pauseBar = document.getElementById('pause-bar');
+        if (pauseBar) pauseBar.classList.remove('show');
+        this._setDot('');
+
+        this._updateApiLog({
+            type: 'optimize',
+            status: 'cancelled',
+            chapterIndex: currentChIdx,
+            chapterTitle: currentChTitle,
+            message: currentChTitle ? `用户取消优化：${currentChTitle}` : '用户取消优化'
+        });
+        this._addInfoLog(currentChTitle ? `⏹ 优化已取消：${currentChTitle}` : '⏹ 优化已取消');
         document.getElementById('ws-phase').textContent = '已取消';
-        setTimeout(() => this._finishOptimize(false), 1000);
+        document.getElementById('ws-detail').textContent = '优化已停止，正在返回阅读器...';
+        setTimeout(() => this._finishOptimize(false), 300);
     }
     
     _finishOptimize(success) {
+        const targetChapter = Number.isInteger(this._optimizeReturnChIdx)
+            ? this._optimizeReturnChIdx
+            : (this._optimizeQueue.length ? this._optimizeQueue[0] : 0);
+        const bookId = this._optimizeBookId;
+        const book = bookId ? this._getBook(bookId) : null;
+        const shouldResumeTranslation = !!(
+            success &&
+            this._wasTranslating &&
+            book &&
+            (book.status === 'translating' || book.status === 'paused')
+        );
+
         this._optimizing = false;
         this._isOptimizeMode = false;
+        this._optimizePaused = false;
+        this._optimizeCurrentIdx = 0;
         this._optimizeQueue = [];
-        const bookId = this._optimizeBookId;
-        const book = this._getBook(bookId);
-        
-        // 恢复按钮
+        this._optimizeResumeResolve = null;
+
+        document.getElementById('btn-pause').textContent = '⏸ 暂停';
+        document.getElementById('btn-pause').disabled = false;
         document.getElementById('btn-cancel').textContent = '✕ 取消';
-        
-        // 如果之前在翻译中，继续翻译
-        if (this._wasTranslating && book && (book.status === 'translating' || book.status === 'paused')) {
+        const pauseBar = document.getElementById('pause-bar');
+        const pauseLabel = pauseBar ? pauseBar.querySelector('span') : null;
+        if (pauseBar) pauseBar.classList.remove('show');
+        if (pauseLabel) pauseLabel.textContent = '⚠️ 翻译已暂停';
+        this._setDot('');
+
+        this.engine = null;
+
+        if (shouldResumeTranslation) {
             document.getElementById('ws-phase').textContent = '准备继续翻译...';
             this._addInfoLog('▶ 恢复翻译任务...');
-            setTimeout(() => this._resumeTranslation(book), 500);
+            setTimeout(() => {
+                if (book) this._resumeBook(book);
+            }, 500);
         } else {
-            // 返回阅读器
             if (book) {
+                this._rdBook = book;
                 this._openReader(book);
-                if (success && this._optimizeQueue.length > 0) {
-                    this._goChapter(this._optimizeQueue[0]);
+                if (Number.isInteger(targetChapter)) {
+                    this._goChapter(targetChapter);
                 }
             } else {
                 this._showPage('shelf');
                 this._renderShelf();
             }
         }
-        
-        // 清理状态
+
         this._optimizeFromReader = false;
         this._optimizeChIdx = null;
         this._optimizeBookId = null;
+        this._optimizeReturnChIdx = null;
         this._wasTranslating = false;
     }
-    
+
     _onCancelled() {
         this._saveProgress(null);
         const book = this._getBook(this.currentBookId);
@@ -1206,6 +1468,10 @@ this._showPage('work');
         };
 
         document.getElementById('btn-pause').addEventListener('click', () => {
+            if (this._isOptimizeMode) {
+                this._toggleOptimizePause();
+                return;
+            }
             const bk = this._getBook(this.currentBookId);
             if (this.engine && this.engine._paused && !this.engine._cancelled) {
                 resumeOrRestart();
@@ -1226,10 +1492,19 @@ this._showPage('work');
         });
 
         document.getElementById('btn-resume-bar').addEventListener('click', () => {
+            if (this._isOptimizeMode) {
+                if (this._optimizePaused) this._toggleOptimizePause();
+                return;
+            }
             resumeOrRestart();
         });
 
         document.getElementById('btn-cancel').addEventListener('click', () => {
+            if (this._isOptimizeMode) {
+                if (!confirm('确定取消优化？')) return;
+                this._cancelOptimize();
+                return;
+            }
             if (!confirm('确定取消翻译？')) return;
             const bk = this._getBook(this.currentBookId);
             if (this.engine) this.engine.cancel();
@@ -1379,25 +1654,48 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
             this._renderLiveContent();
         }
     }
-    
+
     _updateApiLog(d) {
+        if (!d) return;
+
+        const now = Date.now();
+        if (d.status === 'paused' || d.status === 'cancelled') {
+            const stateChapter = typeof d.chapterIndex === 'number' ? d.chapterIndex : '';
+            const stateTitle = d.chapterTitle || '';
+            const stateKey = `${d.type || 'translate'}:${d.status}:${stateChapter}:${stateTitle}`;
+            if (this._lastApiStateKey === stateKey && this._lastApiStateAt && (now - this._lastApiStateAt) < 1500) {
+                return;
+            }
+            this._lastApiStateKey = stateKey;
+            this._lastApiStateAt = now;
+        } else {
+            this._lastApiStateKey = null;
+            this._lastApiStateAt = now;
+        }
+
         const logEl = document.getElementById('live-api-log');
         const statusEl = document.getElementById('live-api-status');
         const time = new Date().toLocaleTimeString();
-        
-        // 更新阅读面板的简洁日志
+        const taskLabel = d.type === 'optimize' ? '优化' : '翻译';
+        const chapterLabel = d.chapterTitle ? ` · ${Utils.escapeHtml(d.chapterTitle)}` : '';
+
         if (logEl && statusEl) {
             logEl.style.display = 'block';
             if (d.status === 'requesting') {
-                statusEl.innerHTML = `<span style="color:var(--accent)">[${time}] 🔄 正在请求API... (${d.batch}句)</span>`;
+                statusEl.innerHTML = `<span style="color:var(--accent)">[${time}] 🔄 正在请求API（${taskLabel} ${d.batch || 0}句${chapterLabel}）</span>`;
             } else if (d.status === 'received') {
                 const preview = Utils.escapeHtml(d.content || '');
-                statusEl.innerHTML = `<span style="color:var(--text-secondary)">[${time}] ✅ 收到响应:</span><br><code style="font-size:0.7rem;word-break:break-all;color:var(--text-dim)">${preview}</code>`;
-                logEl.scrollTop = logEl.scrollHeight;
+                statusEl.innerHTML = `<span style="color:var(--text-secondary)">[${time}] ✅ ${taskLabel}响应${chapterLabel}</span><br><code style="font-size:0.7rem;word-break:break-all;color:var(--text-dim)">${preview}</code>`;
+            } else if (d.status === 'paused') {
+                statusEl.innerHTML = `<span style="color:#d97706">[${time}] ⏸ ${taskLabel}已暂停${chapterLabel}</span>`;
+            } else if (d.status === 'error') {
+                statusEl.innerHTML = `<span style="color:#dc2626">[${time}] ❌ ${taskLabel}失败：${Utils.escapeHtml(d.message || '未知错误')}</span>`;
+            } else if (d.status === 'cancelled') {
+                statusEl.innerHTML = `<span style="color:#dc2626">[${time}] ⏹ ${taskLabel}已取消${chapterLabel}</span>`;
             }
+            logEl.scrollTop = logEl.scrollHeight;
         }
-        
-        // 添加到详细日志面板
+
         this._addDetailedLog(d, time);
     }
     
@@ -1405,39 +1703,47 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         const container = document.getElementById('logs-container');
         const emptyEl = document.getElementById('logs-empty');
         const statsEl = document.getElementById('log-stats');
-        if (!container) return;
+        if (!container || !d) return;
         
         if (emptyEl) emptyEl.style.display = 'none';
         
         const entry = document.createElement('div');
+        const taskLabel = d.type === 'optimize' ? '优化' : '翻译';
+        const chapterLabel = d.chapterTitle ? ` · ${Utils.escapeHtml(d.chapterTitle)}` : '';
         entry.className = 'log-entry';
         
         if (d.status === 'requesting') {
             entry.classList.add('log-request');
-            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type req">REQ</span>请求 ${d.batch} 句翻译`;
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type req">REQ</span>${taskLabel}请求 ${d.batch || 0} 句${chapterLabel}`;
             this._lastRequestTime = Date.now();
         } else if (d.status === 'received') {
             entry.classList.add('log-response');
             const elapsed = this._lastRequestTime ? ((Date.now() - this._lastRequestTime) / 1000).toFixed(2) : '?';
-            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type res">RES</span>响应 (${elapsed}s)<div class="log-content">${Utils.escapeHtml(d.content || '')}</div>`;
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type res">RES</span>${taskLabel}响应 (${elapsed}s)${chapterLabel}<div class="log-content">${Utils.escapeHtml(d.content || '')}</div>`;
+        } else if (d.status === 'paused') {
+            entry.classList.add('log-info');
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type info">PAUSE</span>${taskLabel}暂停${chapterLabel}<div class="log-meta">${Utils.escapeHtml(d.message || '等待继续')}</div>`;
+        } else if (d.status === 'cancelled') {
+            entry.classList.add('log-error');
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type err">STOP</span>${taskLabel}已取消${chapterLabel}`;
         } else if (d.status === 'error') {
             entry.classList.add('log-error');
-            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type err">ERR</span>${Utils.escapeHtml(d.message || '未知错误')}<div class="log-meta">重试 ${d.attempt || '?'}/${d.maxAttempts || 3}</div>`;
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type err">ERR</span>${taskLabel}失败：${Utils.escapeHtml(d.message || '未知错误')}<div class="log-meta">重试 ${d.attempt || '?'}/${d.maxAttempts || 3}</div>`;
+        } else {
+            return;
         }
         
         container.appendChild(entry);
         
-        // 更新日志统计
         this._logCount = (this._logCount || 0) + 1;
         if (statsEl) statsEl.textContent = `${this._logCount} 条日志`;
         
-        // 自动滚动
         const autoScroll = document.getElementById('log-auto-scroll');
         if (autoScroll && autoScroll.checked) {
             container.scrollTop = container.scrollHeight;
         }
     }
-    
+
     _addInfoLog(message) {
         const container = document.getElementById('logs-container');
         const emptyEl = document.getElementById('logs-empty');
@@ -1460,20 +1766,35 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
             container.scrollTop = container.scrollHeight;
         }
     }
-    
+
     _clearLogs() {
         const container = document.getElementById('logs-container');
-        const emptyEl = document.getElementById('logs-empty');
         const statsEl = document.getElementById('log-stats');
-        if (container) container.innerHTML = '<div class="panel-empty" id="logs-empty">🔍 翻译开始后将显示API调用日志...</div>';
+        const logEl = document.getElementById('live-api-log');
+        const statusEl = document.getElementById('live-api-status');
+
+        if (container) container.innerHTML = '<div class="panel-empty" id="logs-empty">🔍 任务开始后将显示API调用日志...</div>';
         if (statsEl) statsEl.textContent = '0 条日志';
+        if (statusEl) statusEl.innerHTML = '';
+        if (logEl) {
+            logEl.style.display = 'none';
+            logEl.scrollTop = 0;
+        }
+
         this._logCount = 0;
+        this._lastRequestTime = null;
+        this._lastApiStateKey = null;
+        this._lastApiStateAt = null;
     }
 
     /* ── 沉浸式阅读器 ── */
 _openReader(book) {
-this.currentBookId = book.id;
-this._rdBook = book;
+        const latestBook = this._getBook(book.id) || book;
+        const latestChapters = Utils.loadLocal(`chapters-${latestBook.id}`, latestBook.chapters || []);
+        const latestResults = Utils.loadLocal(`results-${latestBook.id}`, latestBook.results || []);
+        book = Object.assign({}, latestBook, { chapters: latestChapters, results: latestResults });
+        this.currentBookId = book.id;
+        this._rdBook = book;
 // 恢复阅读进度
 const savedProgress = Utils.loadLocal(`rd-progress-${book.id}`, null);
 this._rdChIdx = savedProgress ? savedProgress.chIdx : 0;
@@ -1523,9 +1844,9 @@ this._rdMode = p.mode||'translated';
         }
     }
     _prepareReaderEngine(book) {
-        // 加载数据以便切换到实况时使用
-        this.chapters = book.chapters || [];
-        this.translationResults = this._cloneResults(book.results || []);
+        // 加载最新数据以便切换到实况时使用
+        this.chapters = Utils.loadLocal(`chapters-${book.id}`, book.chapters || []);
+        this.translationResults = this._cloneResults(Utils.loadLocal(`results-${book.id}`, book.results || []));
         this.fileName = book.fileName;
     }
     _fontMap = {
@@ -1571,29 +1892,39 @@ _saveReadingProgress(){
         ).join('');
     }
     _getReaderChapters(book) {
-        // 如果有完整results则用results，否则用chapters构建
         if (book.results && book.results.length > 0) {
-            // 合并chapters和results的数据
-            return book.results.map((r, i) => {
-                const chap = book.chapters && book.chapters[i];
-                const sentences = r.sentences || [];
-                // 如果results的sentences不完整，用chapters补充
-                if (chap && chap.sentences && sentences.length < chap.sentences.length) {
+            const baseChapters = book.chapters || [];
+            const total = Math.max(baseChapters.length, book.results.length);
+            return Array.from({ length: total }, (_, i) => {
+                const chap = baseChapters[i];
+                const resultChapter = book.results[i] || {};
+                const sentences = Array.isArray(resultChapter.sentences) ? resultChapter.sentences : [];
+
+                if (chap && Array.isArray(chap.sentences) && sentences.length < chap.sentences.length) {
                     const merged = [];
                     for (let j = 0; j < chap.sentences.length; j++) {
                         merged.push(sentences[j] || { original: chap.sentences[j], translation: '' });
                     }
-                    return { title: r.title || chap.title, sentences: merged };
+                    return {
+                        title: resultChapter.title || chap.title || ('第' + (i + 1) + '章'),
+                        sentences: merged
+                    };
                 }
-                return r;
+
+                return {
+                    title: resultChapter.title || (chap && chap.title) || ('第' + (i + 1) + '章'),
+                    sentences: sentences
+                };
             });
         }
+
         if (book.chapters && book.chapters.length > 0) {
             return book.chapters.map(ch => ({
                 title: ch.title,
                 sentences: (ch.sentences || []).map(s => ({ original: s, translation: '' }))
             }));
         }
+
         return [];
     }
     _goChapter(idx){

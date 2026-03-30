@@ -39,8 +39,11 @@ class TranslationEngine {
 
         // 控制
         this._paused = false;
+        this._pausedAt = null;
         this._cancelled = false;
         this._onProgress = null; // callback(event, data)
+        this._listeners = Object.create(null);
+
     }
 
     /**
@@ -768,10 +771,29 @@ return mapped.filter(Boolean).length === originals.length ? mapped : null;
         }
     }
 
+    on(event, handler) {
+        if (!event || typeof handler !== 'function') return () => {};
+        if (!this._listeners[event]) this._listeners[event] = new Set();
+        this._listeners[event].add(handler);
+        return () => this.off(event, handler);
+    }
+
+    off(event, handler) {
+        const bucket = this._listeners[event];
+        if (!bucket) return;
+        bucket.delete(handler);
+        if (bucket.size === 0) delete this._listeners[event];
+    }
+
     _emit(event, data) {
         if (this._onProgress) {
             try { this._onProgress(event, data); } catch (e) { console.warn('Progress callback error:', e); }
         }
+        const bucket = this._listeners[event];
+        if (!bucket) return;
+        [...bucket].forEach(handler => {
+            try { handler(data, event); } catch (e) { console.warn('Event listener error:', event, e); }
+        });
     }
 
     /**
@@ -954,6 +976,7 @@ ${pairsText}${contextAfter}
     /**
      * 增强版章节优化 - 带进度事件、结合前后章节摘要、高推理值
      */
+
     async optimizeChapterEnhanced(chapter, chapterIndex) {
         if (!chapter || !chapter.sentences || chapter.sentences.length === 0) {
             return chapter;
@@ -968,63 +991,89 @@ ${pairsText}${contextAfter}
         }));
         
         const total = pairs.length;
-        const batchSize = 15; // 优化用较小批次以获得更好质量
+        const batchSize = 15;
         const optimizedSentences = [];
         
-        // 获取前后章节摘要
         const prevChapterSummary = this.chapterSummaries[chapterIndex - 1] || '';
-        const currentSummary = this.chapterSummaries[chapterIndex] || '';
+        const currentSummary = this.chapterSummaries[chapterIndex] || chapter.summary || '';
         const nextChapterSummary = this.chapterSummaries[chapterIndex + 1] || '';
         const globalSummary = this.globalSummary || '';
         
-        this.emit('optimizeProgress', { done: 0, total, message: '准备优化...' });
+        this._emit('optimizeProgress', {
+            chapterIndex,
+            done: 0,
+            total,
+            message: '准备优化...'
+        });
         
         for (let i = 0; i < pairs.length; i += batchSize) {
-            if (this._cancelled) {
-                throw new Error('优化已取消');
-            }
+            await this._checkPauseCancel();
             
             const batch = pairs.slice(i, i + batchSize);
             const prevContext = i > 0 ? pairs.slice(Math.max(0, i - 5), i) : [];
             const nextContext = pairs.slice(i + batchSize, i + batchSize + 5);
-            
             const startTime = Date.now();
             
             const optimizedBatch = await this._optimizeBatchDeep(
-                batch, prevContext, nextContext, chapter.title, 
-                { current: currentSummary, prev: prevChapterSummary, next: nextChapterSummary, global: globalSummary }
+                batch,
+                prevContext,
+                nextContext,
+                chapter.title,
+                {
+                    chapterIndex,
+                    startIndex: i,
+                    total,
+                    current: currentSummary,
+                    prev: prevChapterSummary,
+                    next: nextChapterSummary,
+                    global: globalSummary
+                }
             );
             
             optimizedSentences.push(...optimizedBatch);
-            
-            const done = Math.min(i + batchSize, total);
-            this.emit('optimizeProgress', { 
-                done, 
-                total, 
-                message: `优化进度: ${done}/${total}` 
+            this._emit('optimizeChunk', {
+                chapterIndex,
+                startIndex: i,
+                items: optimizedBatch
             });
             
-            this.emit('optimizeBatch', {
+            const done = Math.min(i + batchSize, total);
+            this._emit('optimizeProgress', {
+                chapterIndex,
+                done,
+                total,
+                message: `优化进度: ${done}/${total}`
+            });
+            
+            this._emit('optimizeBatch', {
+                type: 'optimize',
+                chapterIndex,
+                title: chapter.title,
                 inputTokens: this._lastInputTokens || 0,
                 outputTokens: this._lastOutputTokens || 0,
                 duration: Date.now() - startTime,
                 batchSize: batch.length,
-                preview: optimizedBatch[0]?.translation?.slice(0, 50) || ''
+                preview: optimizedBatch[0]?.translation?.slice(0, 80) || '',
+                done,
+                total
             });
         }
         
         return {
             ...chapter,
+            summary: currentSummary,
             sentences: optimizedSentences,
             optimized: true,
             optimizedAt: Date.now()
         };
     }
-    
+
     /**
      * 深度批量优化 - 结合多章节摘要，使用高推理值
      */
+
     async _optimizeBatchDeep(batch, prevContext, nextContext, chapterTitle, summaries) {
+        summaries = summaries || {};
         const glossaryHint = this.glossary.entries.slice(0, 50)
             .map(e => `${e.original} → ${e.translation}`)
             .join('\n');
@@ -1045,7 +1094,6 @@ ${pairsText}${contextAfter}
             `[${i + 1}]\n原文: ${p.original}\n当前译文: ${p.translation}${p.note ? '\n现有注释: ' + p.note : ''}`
         ).join('\n\n');
         
-        // 构建章节上下文摘要
         let summaryContext = '';
         if (summaries.global) summaryContext += `【全书背景】${summaries.global}\n`;
         if (summaries.prev) summaryContext += `【前章摘要】${summaries.prev}\n`;
@@ -1078,37 +1126,89 @@ ${pairsText}${contextAfter}
 不需要修改的句子不要输出。如果全部满意输出 []。
 只输出JSON数组，不要任何额外说明。`;
 
-        try {
-            const res = await this.llm.chat([{ role: 'user', content: prompt }], {
-                temperature: 0.6,  // 稍高温度允许更有创造性的润色
-                max_tokens: 3000
-            });
-            
-            this._lastInputTokens = res.usage?.prompt_tokens || 0;
-            this._lastOutputTokens = res.usage?.completion_tokens || 0;
-            this.tokensInput += this._lastInputTokens;
-            this.tokensOutput += this._lastOutputTokens;
-            
-            const parsed = Utils.parseJSON(res.content);
-            if (Array.isArray(parsed)) {
-                return batch.map((p, i) => {
-                    const fix = parsed.find(x => x.index === i + 1);
-                    return {
-                        original: p.original,
-                        translation: fix && fix.fixed ? fix.fixed : p.translation,
-                        note: fix && fix.note ? fix.note : p.note,
-                        optimizeReason: fix ? fix.reason : null
-                    };
+        while (true) {
+            await this._checkPauseCancel();
+            try {
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: 'requesting',
+                    batch: batch.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || ''
                 });
+
+                const res = await this.llm.chat([{ role: 'user', content: prompt }], {
+                    temperature: 0.6,
+                    max_tokens: 3000
+                });
+
+                const content = String(res.content || '');
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: 'received',
+                    batch: batch.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    content: content.slice(0, 240) + (content.length > 240 ? '...' : '')
+                });
+
+                this._lastInputTokens = res.usage?.prompt_tokens || 0;
+                this._lastOutputTokens = res.usage?.completion_tokens || 0;
+                this.tokensInput += this._lastInputTokens;
+                this.tokensOutput += this._lastOutputTokens;
+
+                const parsed = Utils.parseJSON(content);
+                if (Array.isArray(parsed)) {
+                    return batch.map((p, i) => {
+                        const fix = parsed.find(x => x.index === i + 1);
+                        return {
+                            original: p.original,
+                            translation: fix && fix.fixed ? fix.fixed : p.translation,
+                            note: fix && fix.note ? fix.note : p.note,
+                            optimizeReason: fix ? fix.reason : null
+                        };
+                    });
+                }
+
+                return batch.map(p => ({ original: p.original, translation: p.translation, note: p.note }));
+            } catch (e) {
+                if (this._cancelled) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'cancelled',
+                        batch: batch.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已取消'
+                    });
+                    throw new Error('CANCELLED');
+                }
+                if (this._paused || this._isRequestAbortedError(e)) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'paused',
+                        batch: batch.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已暂停'
+                    });
+                    await this._checkPauseCancel();
+                    continue;
+                }
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: 'error',
+                    batch: batch.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    message: e.message || '未知错误'
+                });
+                console.warn('深度优化失败，保留原译文:', e);
+                return batch.map(p => ({ original: p.original, translation: p.translation, note: p.note }));
             }
-        } catch (e) {
-            console.warn('深度优化失败，保留原译文:', e);
-            if (this._cancelled) throw e;
         }
-        
-        return batch.map(p => ({ original: p.original, translation: p.translation, note: p.note }));
     }
-    
+
     /**
      * 增强版批量优化 - 结合原文和上下文进行深度润色
      */
