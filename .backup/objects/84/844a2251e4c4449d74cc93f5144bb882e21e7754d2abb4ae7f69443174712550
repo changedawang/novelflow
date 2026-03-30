@@ -184,7 +184,7 @@ this._openReader(book);
         return model;
     }
     _loadSettings() {
-        const raw = Utils.loadLocal('settings', { provider:'deepseek', apiKeys:[], baseUrl:'', model:'deepseek-chat', reasoning:'balanced', temperature:0.3, maxTokens:1024, batchSize:30, autoOptimize:false });
+        const raw = Utils.loadLocal('settings', { provider:'deepseek', apiKeys:[], baseUrl:'', model:'deepseek-chat', reasoning:'balanced', temperature:0.3, maxTokens:1024 });
         // 兼容旧版单key
         if (raw.apiKey && (!raw.apiKeys || raw.apiKeys.length === 0)) {
             raw.apiKeys = [raw.apiKey]; delete raw.apiKey;
@@ -192,7 +192,6 @@ this._openReader(book);
         raw.provider = raw.provider || 'deepseek';
         raw.model = this._getEffectiveModel(raw.provider, raw.model);
         if (!raw.reasoning) raw.reasoning = 'balanced';
-        if (!raw.batchSize) raw.batchSize = 30;
         this.settings = raw;
     }
     _openSettingsModal() {
@@ -214,9 +213,6 @@ this._openReader(book);
         document.getElementById('api-reasoning').value = s.reasoning || 'balanced';
         document.getElementById('api-temp').value = s.temperature || 0.3;
         document.getElementById('api-max-tokens').value = s.maxTokens || 1024;
-        document.getElementById('batch-size').value = s.batchSize || 30;
-        document.getElementById('batch-size-val').textContent = s.batchSize || 30;
-        document.getElementById('auto-optimize').checked = !!s.autoOptimize;
         this._toggleCustomUrl();
         this._toggleCustomTemp();
         document.getElementById('modal-settings').classList.remove('hidden');
@@ -593,7 +589,6 @@ this._showPage('work');
             temperature: parseFloat(s.temperature)||0.3,
             autoGlossary: document.getElementById('cfg-glossary').checked,
             autoStyle: document.getElementById('cfg-style').checked,
-            translationBatchSize: s.batchSize || 30,
         };
         const engine = new TranslationEngine(cfg);
         const runId = ++this._engineRunId;
@@ -670,10 +665,6 @@ this._showPage('work');
                     const chapter = this._ensureResultChapter(chapterIndex);
                     if (this.engine.chapterSummaries[d.chapterIndex] !== undefined) {
                         chapter.summary = this.engine.chapterSummaries[d.chapterIndex];
-                    }
-                    // 自动优化：章节翻译完成后自动优化该章节
-                    if (this.settings.autoOptimize && !this._optimizing) {
-                        this._autoOptimizeChapter(chapterIndex);
                     }
                 }
                 this._saveProgress(null);
@@ -815,37 +806,10 @@ this._showPage('work');
         }
     }
     
-    // 自动优化单个章节（翻译完成后自动触发）
-    async _autoOptimizeChapter(chapterIndex) {
-        const book = this._getBook(this.currentBookId);
-        if (!book || !this.engine) return;
-        
-        const results = this._materializeResults();
-        if (!results || !results[chapterIndex]) return;
-        
-        this._optimizing = true;
-        this._addInfoLog(`自动优化: 第${chapterIndex + 1}章开始...`);
-        
-        try {
-            const chapter = results[chapterIndex];
-            const optimized = await this.engine.optimizeSingleChapter(chapter, chapterIndex);
-            if (optimized) {
-                results[chapterIndex] = optimized;
-                Utils.saveLocal(`results-${book.id}`, results);
-                this._addInfoLog(`自动优化: 第${chapterIndex + 1}章完成`);
-            }
-        } catch (e) {
-            console.warn('自动优化失败:', e);
-            this._addInfoLog(`自动优化失败: ${e.message}`);
-        } finally {
-            this._optimizing = false;
-        }
-    }
-    
     async _startReaderOptimize() {
         const book = this._rdBook;
-        if (!book) {
-            alert('请先打开一本书');
+        if (!book || book.status !== 'done') {
+            alert('仅翻译完成的书籍可优化');
             return;
         }
         const results = Utils.loadLocal(`results-${book.id}`, []);
@@ -853,13 +817,6 @@ this._showPage('work');
             alert('没有可优化的翻译结果');
             return;
         }
-        
-        // 弹窗选择优化范围
-        const chIdx = this._rdChIdx;
-        const currentChTitle = results[chIdx] ? results[chIdx].title : `第${chIdx+1}章`;
-        const choice = confirm(`优化选项：\n\n点击"确定" → 优化当前章节（${currentChTitle}）\n点击"取消" → 取消操作\n\n提示：优化会润色译文，使其更通顺、更符合中文表达习惯。`);
-        
-        if (!choice) return;
         
         const btn = document.getElementById('btn-rd-optimize');
         const origText = btn.querySelector('span:last-child').textContent;
@@ -869,27 +826,26 @@ this._showPage('work');
         
         // 初始化引擎（如果需要）
         if (!this.engine) {
-            const s = this.settings;
+            const cfg = Utils.loadLocal('api-config', {});
             this.engine = new TranslationEngine({
-                api: { apiKeys: s.apiKeys, model: s.model, baseUrl: s.baseUrl, provider: s.provider },
+                api: cfg,
                 targetLang: book.targetLang || '简体中文',
+                novelType: book.novelType || '通用'
             });
         }
         // 恢复术语表和摘要
-        if (book.glossary) this.engine.glossary.fromJSON(book.glossary);
-        if (book.styleProfile) this.engine.styleProfile = book.styleProfile;
-        this.engine.chapterSummaries = book.chapterSummaries || {};
+        this.engine.glossary.entries = Utils.loadLocal(`glossary-${book.id}`, []);
+        this.engine.chapterSummaries = Utils.loadLocal(`summaries-${book.id}`, {});
         
         try {
-            const chapter = results[chIdx];
-            const optimized = await this.engine.optimizeSingleChapter(chapter, chIdx);
+            const optimized = await this.engine.optimizeTranslation(results, (done, total) => {
+                if (!this._optimizing) return;
+                btn.querySelector('span:last-child').textContent = `${Math.round(done/total*100)}%`;
+            });
             if (this._optimizing && optimized) {
-                results[chIdx] = optimized;
-                Utils.saveLocal(`results-${book.id}`, results);
-                book.results = results;
-                this._saveBook(book);
+                Utils.saveLocal(`results-${book.id}`, optimized);
                 this._renderChContent(); // 刷新当前章节
-                alert(`第${chIdx+1}章优化完成！`);
+                alert('优化完成！');
             }
         } catch (e) {
             console.error('优化失败', e);

@@ -844,8 +844,8 @@ this._showPage('work');
     
     async _startReaderOptimize() {
         const book = this._rdBook;
-        if (!book) {
-            alert('请先打开一本书');
+        if (!book || book.status !== 'done') {
+            alert('仅翻译完成的书籍可优化');
             return;
         }
         const results = Utils.loadLocal(`results-${book.id}`, []);
@@ -853,13 +853,6 @@ this._showPage('work');
             alert('没有可优化的翻译结果');
             return;
         }
-        
-        // 弹窗选择优化范围
-        const chIdx = this._rdChIdx;
-        const currentChTitle = results[chIdx] ? results[chIdx].title : `第${chIdx+1}章`;
-        const choice = confirm(`优化选项：\n\n点击"确定" → 优化当前章节（${currentChTitle}）\n点击"取消" → 取消操作\n\n提示：优化会润色译文，使其更通顺、更符合中文表达习惯。`);
-        
-        if (!choice) return;
         
         const btn = document.getElementById('btn-rd-optimize');
         const origText = btn.querySelector('span:last-child').textContent;
@@ -869,27 +862,26 @@ this._showPage('work');
         
         // 初始化引擎（如果需要）
         if (!this.engine) {
-            const s = this.settings;
+            const cfg = Utils.loadLocal('api-config', {});
             this.engine = new TranslationEngine({
-                api: { apiKeys: s.apiKeys, model: s.model, baseUrl: s.baseUrl, provider: s.provider },
+                api: cfg,
                 targetLang: book.targetLang || '简体中文',
+                novelType: book.novelType || '通用'
             });
         }
         // 恢复术语表和摘要
-        if (book.glossary) this.engine.glossary.fromJSON(book.glossary);
-        if (book.styleProfile) this.engine.styleProfile = book.styleProfile;
-        this.engine.chapterSummaries = book.chapterSummaries || {};
+        this.engine.glossary.entries = Utils.loadLocal(`glossary-${book.id}`, []);
+        this.engine.chapterSummaries = Utils.loadLocal(`summaries-${book.id}`, {});
         
         try {
-            const chapter = results[chIdx];
-            const optimized = await this.engine.optimizeSingleChapter(chapter, chIdx);
+            const optimized = await this.engine.optimizeTranslation(results, (done, total) => {
+                if (!this._optimizing) return;
+                btn.querySelector('span:last-child').textContent = `${Math.round(done/total*100)}%`;
+            });
             if (this._optimizing && optimized) {
-                results[chIdx] = optimized;
-                Utils.saveLocal(`results-${book.id}`, results);
-                book.results = results;
-                this._saveBook(book);
+                Utils.saveLocal(`results-${book.id}`, optimized);
                 this._renderChContent(); // 刷新当前章节
-                alert(`第${chIdx+1}章优化完成！`);
+                alert('优化完成！');
             }
         } catch (e) {
             console.error('优化失败', e);
