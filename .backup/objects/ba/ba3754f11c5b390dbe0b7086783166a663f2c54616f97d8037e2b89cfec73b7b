@@ -860,10 +860,7 @@ this._showPage('work');
             alert('请先打开一本书');
             return;
         }
-        // 优先使用 book.results，如果没有则从 localStorage 加载
-        let results = book.results && book.results.length > 0 
-            ? book.results 
-            : Utils.loadLocal(`results-${book.id}`, []);
+        const results = Utils.loadLocal(`results-${book.id}`, []);
         if (!results || results.length === 0) {
             alert('没有可优化的翻译结果');
             return;
