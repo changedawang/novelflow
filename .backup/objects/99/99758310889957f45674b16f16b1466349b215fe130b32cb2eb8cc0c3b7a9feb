@@ -18,69 +18,17 @@ class UIController {
     }
 
     /* ── 初始化 ── */
-_init() {
-this._loadSettings();
-this._ensureSampleBook();
-this._bindNav();
-this._bindUpload();
-this._bindConfig();
-this._bindWork();
-this._bindReader();
-this._bindModals();
-this._renderShelf();
-// 页面加载时恢复翻译中的任务
-this._autoResumeTranslation();
-// 页面隐藏/关闭时保存进度
-this._bindVisibilityChange();
-}
-
-/* ── 自动恢复翻译 ── */
-_autoResumeTranslation() {
-const books = this._getBooks();
-const translatingBook = books.find(b => b.status === 'translating');
-if (translatingBook) {
-// 有未完成的翻译任务，询问是否恢复
-setTimeout(() => {
-    if (confirm(`发现未完成的翻译任务：${translatingBook.fileName}\n是否继续翻译？`)) {
-        this._resumeBook(translatingBook);
+    _init() {
+        this._loadSettings();
+        this._ensureSampleBook();
+        this._bindNav();
+        this._bindUpload();
+        this._bindConfig();
+        this._bindWork();
+        this._bindReader();
+        this._bindModals();
+        this._renderShelf();
     }
-}, 500);
-}
-}
-
-/* ── 页面可见性监听 ── */
-_bindVisibilityChange() {
-// 页面隐藏时保存进度
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        this._saveCurrentProgress();
-    }
-});
-// 页面关闭前保存
-window.addEventListener('beforeunload', () => {
-    this._saveCurrentProgress();
-});
-// 页面重新可见时，如果有翻译任务且引擎停止了，自动恢复
-document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && this.currentBookId) {
-        const book = this._getBook(this.currentBookId);
-        if (book && book.status === 'translating' && (!this.engine || this.engine._cancelled)) {
-            this._resumeBook(book);
-        }
-    }
-});
-}
-
-_saveCurrentProgress() {
-// 保存翻译进度
-if (this.engine && this.currentBookId) {
-    this._saveProgress(null);
-}
-// 保存阅读进度
-if (this._rdBook) {
-    this._saveReadingProgress();
-}
-}
 
     /* ── 页面切换 ── */
     _showPage(name) {
