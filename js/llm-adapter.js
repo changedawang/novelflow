@@ -244,6 +244,7 @@ class LLMAdapter {
         const choice = data.choices[0];
         const content = this._extractChoiceText(choice);
         const reasoning = this._extractChoiceReasoning(choice);
+        const finishReason = String(choice.finish_reason || data.finish_reason || '').trim();
 
         if (content === null || content === undefined || content === '') {
             throw new Error('模型返回空内容(content=null)，可能该模型不可用或不支持当前请求，请尝试更换模型');
@@ -253,7 +254,8 @@ class LLMAdapter {
             content: content,
             reasoning: reasoning,
             usage: data.usage || { prompt_tokens:0, completion_tokens:0, total_tokens:0 },
-            reasoningMeta: response._reasoningMeta || null
+            reasoningMeta: response._reasoningMeta || null,
+            finishReason: finishReason
         };
     }
 
@@ -289,6 +291,11 @@ class LLMAdapter {
                     }
 
                     const choice = p.choices?.[0] || {};
+                    const finishReason = String(choice.finish_reason || p.finish_reason || '').trim();
+                    if (finishReason) {
+                        yield { type: 'finish', finishReason: finishReason };
+                    }
+
                     const delta = choice.delta || choice.message || {};
                     const reasoningDelta = this._toPlainText(
                         delta.reasoning_content !== undefined ? delta.reasoning_content

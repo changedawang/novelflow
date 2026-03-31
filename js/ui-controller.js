@@ -793,11 +793,16 @@ this._showPage('work');
             case 'keySwitch':
                 document.getElementById('ws-detail').textContent = `密钥切换 #${d.to+1}/${d.total} (${d.reason})`;
                 break;
-            case 'error':
+            case 'error': {
                 this._setDot('error');
                 document.getElementById('ws-detail').textContent = d.message||'';
-                this._addDetailedLog({ status: 'error', message: d.message, attempt: d.attempt, maxAttempts: d.maxAttempts }, new Date().toLocaleTimeString());
+                this._updateApiLog(Object.assign({}, d, {
+                    status: 'error',
+                    taskType: d.taskType || 'translate',
+                    type: d.taskType || 'translate'
+                }));
                 break;
+            }
         }
     }
     _saveProgress(d) {
@@ -1859,6 +1864,15 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         return raw.length > maxLen ? raw.slice(0, maxLen) + '\n...(已截断)' : raw;
     }
 
+    _formatUsageMeta(usage) {
+        if (!usage || typeof usage !== 'object') return '';
+        const prompt = Number(usage.prompt_tokens || 0);
+        const completion = Number(usage.completion_tokens || 0);
+        const total = Number(usage.total_tokens || (prompt + completion) || 0);
+        if (!prompt && !completion && !total) return '';
+        return `tokens: in ${Utils.formatNumber(prompt)} / out ${Utils.formatNumber(completion)} / total ${Utils.formatNumber(total)}`;
+    }
+
     _updateApiLog(d) {
         if (!d) return;
 
@@ -1880,11 +1894,12 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         const logEl = document.getElementById('live-api-log');
         const statusEl = document.getElementById('live-api-status');
         const time = new Date().toLocaleTimeString();
-        const taskLabel = d.type === 'optimize' ? '优化' : '翻译';
+        const taskType = d.taskType || d.type || 'translate';
+        const taskLabel = taskType === 'optimize' ? '优化' : '翻译';
         const chapterLabel = d.chapterTitle ? ` · ${Utils.escapeHtml(d.chapterTitle)}` : '';
         const effortText = this._formatReasoningEffortLabel(d.reasoningEffort);
         const effortLabel = effortText ? ` · 原生推理${effortText}` : '';
-        const batchLabel = d.type === 'optimize'
+        const batchLabel = taskType === 'optimize'
             ? `整章请求（${d.batch || 0}句）`
             : `${d.batch || 0}句`;
         const requestedModeText = this._formatReasoningModeLabel(d.reasoningRequestedMode);
@@ -1894,6 +1909,31 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
             : '';
         const reasoningPreview = Utils.escapeHtml(this._trimLogText(d.reasoningPreview || d.reasoning || '', 1800));
         const contentPreview = Utils.escapeHtml(this._trimLogText(d.contentPreview || d.content || '', 1400));
+        const finishReasonText = String(d.finishReason || '').trim();
+        const usageText = this._formatUsageMeta(d.usage);
+        const responseMetaParts = [];
+        if (finishReasonText) responseMetaParts.push(`finish_reason=${finishReasonText}`);
+        if (usageText) responseMetaParts.push(usageText);
+        if (d.requestId) responseMetaParts.push(`请求#${d.requestId}`);
+        const responseMetaHtml = responseMetaParts.length
+            ? `<div style="margin-top:6px;color:var(--text-dim);line-height:1.45">${Utils.escapeHtml(responseMetaParts.join(' · '))}</div>`
+            : '';
+        const errorMetaParts = [];
+        if (typeof d.batch === 'number' && d.batch > 0) errorMetaParts.push(`批量=${d.batch}句`);
+        if (typeof d.expectedCount === 'number' || typeof d.actualCount === 'number') errorMetaParts.push(`条数=${d.expectedCount ?? '?'}→${d.actualCount ?? '?'}`);
+        if (typeof d.jsonCount === 'number' || typeof d.textCount === 'number') errorMetaParts.push(`解析=json:${d.jsonCount ?? 0}/text:${d.textCount ?? 0}`);
+        if (d.parseSource) errorMetaParts.push(`来源=${d.parseSource}`);
+        if (finishReasonText) errorMetaParts.push(`finish_reason=${finishReasonText}`);
+        if (d.maxTokens) errorMetaParts.push(`maxTokens=${d.maxTokens}`);
+        if (typeof d.responseLength === 'number' && d.responseLength >= 0) errorMetaParts.push(`响应长度=${d.responseLength}`);
+        if (usageText) errorMetaParts.push(usageText);
+        if (d.requestId) errorMetaParts.push(`请求#${d.requestId}`);
+        const errorMetaHtml = errorMetaParts.length
+            ? `<div style="margin-top:6px;white-space:pre-wrap;line-height:1.45;color:var(--text-dim)">${Utils.escapeHtml(errorMetaParts.join(' · '))}</div>`
+            : '';
+        const errorPreviewBlock = contentPreview
+            ? `<details style="margin-top:6px"><summary style="cursor:pointer;color:#dc2626">查看原始返回预览</summary><div style="margin-top:6px;white-space:pre-wrap;line-height:1.45;color:var(--text-dim)">${contentPreview}</div></details>`
+            : '';
 
         if (logEl && statusEl) {
             logEl.style.display = 'block';
@@ -1919,11 +1959,11 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
                 const reasoningBlock = reasoningPreview
                     ? `<details style="margin-top:6px"><summary style="cursor:pointer;color:#7c3aed">查看思维链 / 推理</summary><div style="margin-top:6px;white-space:pre-wrap;line-height:1.5;color:#6b4ce6">${reasoningPreview}</div></details>`
                     : (reasoningFallbackText ? `<div style="margin-top:6px;color:var(--text-dim)">${Utils.escapeHtml(reasoningFallbackText)}</div>` : '');
-                statusEl.innerHTML = `<span style="color:var(--text-secondary)">[${time}] ✅ ${taskLabel}响应${chapterLabel}${effortLabel}${reasoningModeMeta}</span>${reasoningBlock}<code style="display:block;margin-top:6px;font-size:0.7rem;word-break:break-all;white-space:pre-wrap;color:var(--text-dim)">${contentPreview}</code>`;
+                statusEl.innerHTML = `<span style="color:var(--text-secondary)">[${time}] ✅ ${taskLabel}响应${chapterLabel}${effortLabel}${reasoningModeMeta}</span>${responseMetaHtml}${reasoningBlock}<code style="display:block;margin-top:6px;font-size:0.7rem;word-break:break-all;white-space:pre-wrap;color:var(--text-dim)">${contentPreview}</code>`;
             } else if (d.status === 'paused') {
                 statusEl.innerHTML = `<span style="color:#d97706">[${time}] ⏸ ${taskLabel}已暂停${chapterLabel}</span>`;
             } else if (d.status === 'error') {
-                statusEl.innerHTML = `<span style="color:#dc2626">[${time}] ❌ ${taskLabel}失败：${Utils.escapeHtml(d.message || '未知错误')}</span>`;
+                statusEl.innerHTML = `<span style="color:#dc2626">[${time}] ❌ ${taskLabel}失败：${Utils.escapeHtml(d.message || '未知错误')}</span>${errorMetaHtml}${errorPreviewBlock}`;
             } else if (d.status === 'cancelled') {
                 statusEl.innerHTML = `<span style="color:#dc2626">[${time}] ⏹ ${taskLabel}已取消${chapterLabel}</span>`;
             }
@@ -1944,7 +1984,8 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         if (emptyEl) emptyEl.style.display = 'none';
         
         const entry = document.createElement('div');
-        const taskLabel = d.type === 'optimize' ? '优化' : '翻译';
+        const taskType = d.taskType || d.type || 'translate';
+        const taskLabel = taskType === 'optimize' ? '优化' : '翻译';
         const chapterLabel = d.chapterTitle ? ` · ${Utils.escapeHtml(d.chapterTitle)}` : '';
         const effortText = this._formatReasoningEffortLabel(d.reasoningEffort);
         const requestedModeText = this._formatReasoningModeLabel(d.reasoningRequestedMode);
@@ -1953,11 +1994,13 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
         const reasoningModeMeta = requestedModeText
             ? `<div class="log-meta">推理参数：${Utils.escapeHtml(requestedModeText)}${finalModeText && finalModeText !== requestedModeText ? ` → ${Utils.escapeHtml(finalModeText)}` : ''}</div>`
             : '';
-        const requestLabel = d.type === 'optimize'
+        const requestLabel = taskType === 'optimize'
             ? `整章请求（${d.batch || 0}句）`
             : `${d.batch || 0}句`;
-        const contentText = this._trimLogText(d.content || '', 2400);
+        const contentText = this._trimLogText(d.content || d.contentPreview || '', 2400);
         const reasoningText = this._trimLogText(d.reasoning || '', 5000);
+        const finishReasonText = String(d.finishReason || '').trim();
+        const usageText = this._formatUsageMeta(d.usage);
         entry.className = 'log-entry';
         
         if (d.status === 'requesting') {
@@ -1975,8 +2018,13 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
             const reasoningBlock = reasoningText
                 ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:#7c3aed">思维链 / 推理</summary><div class="log-content" style="margin-top:6px;color:#6b4ce6;white-space:pre-wrap;line-height:1.5">${Utils.escapeHtml(reasoningText)}</div></details>`
                 : (reasoningFallbackText ? `<div class="log-meta">${Utils.escapeHtml(reasoningFallbackText)}</div>` : '');
+            const responseMetaParts = [];
+            if (finishReasonText) responseMetaParts.push(`finish_reason=${finishReasonText}`);
+            if (usageText) responseMetaParts.push(usageText);
+            if (d.requestId) responseMetaParts.push(`请求#${d.requestId}`);
+            const responseMetaBlock = responseMetaParts.length ? `<div class="log-meta">${Utils.escapeHtml(responseMetaParts.join(' · '))}</div>` : '';
             const contentBlock = contentText ? `<div class="log-content">${Utils.escapeHtml(contentText)}</div>` : '';
-            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type res">RES</span>${taskLabel}响应 (${elapsed}s)${chapterLabel}${effortMeta}${reasoningModeMeta}${reasoningBlock}${contentBlock}`;
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type res">RES</span>${taskLabel}响应 (${elapsed}s)${chapterLabel}${effortMeta}${reasoningModeMeta}${responseMetaBlock}${reasoningBlock}${contentBlock}`;
         } else if (d.status === 'paused') {
             entry.classList.add('log-info');
             entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type info">PAUSE</span>${taskLabel}暂停${chapterLabel}<div class="log-meta">${Utils.escapeHtml(d.message || '等待继续')}</div>`;
@@ -1985,7 +2033,21 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
             entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type err">STOP</span>${taskLabel}已取消${chapterLabel}`;
         } else if (d.status === 'error') {
             entry.classList.add('log-error');
-            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type err">ERR</span>${taskLabel}失败：${Utils.escapeHtml(d.message || '未知错误')}<div class="log-meta">重试 ${d.attempt || '?'}/${d.maxAttempts || 3}</div>`;
+            const errorMetaParts = [`重试 ${d.attempt || '?'}/${d.maxAttempts || 3}`];
+            if (typeof d.batch === 'number' && d.batch > 0) errorMetaParts.push(`批量 ${d.batch}句`);
+            if (typeof d.expectedCount === 'number' || typeof d.actualCount === 'number') errorMetaParts.push(`条数 期望${d.expectedCount ?? '?'} / 实际${d.actualCount ?? '?'}`);
+            if (typeof d.jsonCount === 'number' || typeof d.textCount === 'number') errorMetaParts.push(`解析 json=${d.jsonCount ?? 0} / text=${d.textCount ?? 0}`);
+            if (d.parseSource) errorMetaParts.push(`来源 ${d.parseSource}`);
+            if (finishReasonText) errorMetaParts.push(`finish_reason=${finishReasonText}`);
+            if (d.maxTokens) errorMetaParts.push(`maxTokens=${d.maxTokens}`);
+            if (typeof d.responseLength === 'number' && d.responseLength >= 0) errorMetaParts.push(`响应长度=${d.responseLength}`);
+            if (usageText) errorMetaParts.push(usageText);
+            if (d.requestId) errorMetaParts.push(`请求#${d.requestId}`);
+            const errorMetaBlock = errorMetaParts.map(text => `<div class="log-meta">${Utils.escapeHtml(text)}</div>`).join('');
+            const previewBlock = contentText
+                ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:#dc2626">原始返回预览</summary><div class="log-content" style="margin-top:6px;color:var(--text-dim);white-space:pre-wrap;line-height:1.45">${Utils.escapeHtml(contentText)}</div></details>`
+                : '';
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-type err">ERR</span>${taskLabel}失败：${Utils.escapeHtml(d.message || '未知错误')}${errorMetaBlock}${previewBlock}`;
         } else {
             return;
         }

@@ -377,7 +377,12 @@ class TranslationEngine {
                     this.tokensInput += res.usage.prompt_tokens || 0;
                     this.tokensOutput += res.usage.completion_tokens || 0;
                     this._consecutiveErrors = 0;
-                    return this._parseBatchTranslationResponse(res.content, sentences);
+                    return this._parseBatchTranslationResponse(res.content, sentences, {
+                        finishReason: res.finishReason,
+                        requestId: res.requestId,
+                        usage: res.usage,
+                        maxTokens: maxTokens
+                    });
                 } catch (e) {
                     if (this._cancelled) throw new Error('CANCELLED');
                     if (this._paused || this._isRequestAbortedError(e)) {
@@ -387,12 +392,27 @@ class TranslationEngine {
                     }
                     lastError = e;
                     const isParseError = !!e._batchParseFailure;
+                    const details = e && e._batchDetails ? e._batchDetails : null;
                     this._emit('error', {
+                        taskType: 'translate',
                         type: isParseError ? 'format' : 'api',
                         message: e.message,
                         attempt: attempt + 1,
                         maxAttempts: 3,
                         sentence: (sentences[0] || '').slice(0, 50),
+                        batch: sentences.length,
+                        chapterIndex: context.chapterIndex,
+                        requestId: details ? details.requestId : undefined,
+                        expectedCount: details ? details.expectedCount : undefined,
+                        actualCount: details ? details.actualCount : undefined,
+                        jsonCount: details ? details.jsonCount : undefined,
+                        textCount: details ? details.textCount : undefined,
+                        parseSource: details ? details.parseSource : '',
+                        finishReason: details ? details.finishReason : '',
+                        responseLength: details ? details.responseLength : undefined,
+                        usage: details ? details.usage : null,
+                        contentPreview: details ? details.responsePreview : '',
+                        maxTokens: details ? details.maxTokens : maxTokens
                     });
                     if (attempt < 2) {
                         const delay = isParseError ? 1000 : 3000 * (attempt + 1);
@@ -408,8 +428,8 @@ class TranslationEngine {
             }
 
             if (lastError && lastError._batchParseFailure) {
-                console.warn('批量翻译解析失败，回退到逐句模式:', lastError);
-                return this._translateBatchSequentialFallback(sentences, context);
+                console.warn('批量翻译解析失败，拆半后重试:', lastError);
+                return this._translateBatchParseFailureFallback(sentences, context);
             }
 
             this._consecutiveErrors = (this._consecutiveErrors || 0) + 1;
@@ -423,6 +443,55 @@ class TranslationEngine {
             await this._checkPauseCancel();
             this._emit('phase', { phase:'retrying', message:'恢复中，重新尝试...' });
         }
+    }
+
+    _mergeSlidingWindow(baseWindow, items) {
+        const window = [...(baseWindow || [])];
+        for (let i = 0; i < (items || []).length; i++) {
+            const item = items[i];
+            if (!item || !item.translation) continue;
+            window.push({ original: item.original, translation: item.translation });
+            if (window.length > this.config.windowSize) {
+                window.shift();
+            }
+        }
+        return window;
+    }
+
+    async _translateBatchParseFailureFallback(sentences, context) {
+        if (!sentences || sentences.length === 0) {
+            return { items: [], newTerms: [] };
+        }
+
+        if (sentences.length <= 2) {
+            this._emit('phase', {
+                phase: 'retrying',
+                message: `批量失败，改逐句重试（${sentences.length}句）...`
+            });
+            return this._translateBatchSequentialFallback(sentences, context);
+        }
+
+        const leftSize = Math.ceil(sentences.length / 2);
+        const rightSize = sentences.length - leftSize;
+        this._emit('phase', {
+            phase: 'retrying',
+            message: `批量失败，拆半重试（${sentences.length}→${leftSize}+${rightSize}）...`
+        });
+
+        const leftSentences = sentences.slice(0, leftSize);
+        const rightSentences = sentences.slice(leftSize);
+        const leftResult = await this._translateBatch(leftSentences, context);
+        const rightContext = {
+            ...context,
+            sentenceIndex: (context.sentenceIndex || 0) + leftSize,
+            slidingWindow: this._mergeSlidingWindow(context.slidingWindow, leftResult.items)
+        };
+        const rightResult = await this._translateBatch(rightSentences, rightContext);
+
+        return {
+            items: [...leftResult.items, ...rightResult.items],
+            newTerms: this._normalizeTerms([...(leftResult.newTerms || []), ...(rightResult.newTerms || [])]),
+        };
     }
 
     async _translateBatchSequentialFallback(sentences, context) {
@@ -621,6 +690,7 @@ return [
             let reasoning = '';
             let usage = null;
             let reasoningMeta = null;
+            let finishReason = '';
             let lastReasoningEmitAt = 0;
             let lastContentEmitAt = 0;
 
@@ -635,6 +705,9 @@ return [
                         continue;
                     } else if (chunk.type === 'usage' && chunk.usage) {
                         usage = chunk.usage;
+                        continue;
+                    } else if (chunk.type === 'finish' && chunk.finishReason) {
+                        finishReason = String(chunk.finishReason || '').trim();
                         continue;
                     } else if (chunk.type === 'reasoning' && chunk.delta) {
                         reasoning += chunk.delta;
@@ -692,9 +765,11 @@ return [
                         reasoningRequestedMode: reasoningMeta && reasoningMeta.requestedMode ? reasoningMeta.requestedMode : requestedReasoningMode,
                         reasoningMode: finalReasoningMode,
                         reasoning,
-                        content
+                        content,
+                        usage,
+                        finishReason
                     });
-                    return { content, reasoning, usage, reasoningMeta };
+                    return { content, reasoning, usage, reasoningMeta, finishReason, requestId };
                 }
             } catch (e) {
                 if (this._cancelled || this._paused || this._isRequestAbortedError(e)) {
@@ -708,6 +783,8 @@ return [
         const content = String(res.content || '');
         const reasoning = String(res.reasoning || '').trim();
         const reasoningMeta = res.reasoningMeta || null;
+        const usage = res.usage || this._estimateUsageFromText(messages, content, reasoning);
+        const finishReason = String(res.finishReason || '').trim();
         const finalReasoningMode = reasoningMeta && reasoningMeta.finalMode ? reasoningMeta.finalMode : requestedReasoningMode;
         this._emit('apiCall', {
             type,
@@ -720,13 +797,17 @@ return [
             reasoningRequestedMode: reasoningMeta && reasoningMeta.requestedMode ? reasoningMeta.requestedMode : requestedReasoningMode,
             reasoningMode: finalReasoningMode,
             reasoning,
-            content
+            content,
+            usage,
+            finishReason
         });
         return {
             content,
             reasoning,
             reasoningMeta,
-            usage: res.usage || this._estimateUsageFromText(messages, content, reasoning)
+            usage,
+            finishReason,
+            requestId
         };
     }
 
@@ -770,46 +851,67 @@ return [
             .trim();
     }
 
-    _extractBatchTranslations(data, originals) {
-if (!data) return null;
+    _trimBatchResponsePreview(text, maxLen = 1200) {
+        const raw = String(text || '').trim();
+        if (!raw) return '';
+        return raw.length > maxLen ? raw.slice(0, maxLen) + '\n...(已截断)' : raw;
+    }
 
-const rawItems = Array.isArray(data) ? data
-: Array.isArray(data.translations) ? data.translations
-: Array.isArray(data.items) ? data.items
-: Array.isArray(data.results) ? data.results
-: Array.isArray(data.lines) ? data.lines
-: null;
+    _describeBatchFinishReason(finishReason) {
+        const reason = String(finishReason || '').trim().toLowerCase();
+        if (!reason) return '';
+        if (reason === 'length' || reason === 'max_tokens') return '模型输出被长度上限截断';
+        if (reason === 'content_filter') return '模型输出被内容过滤截断';
+        if (reason === 'stop') return '模型正常停止，但返回条数不足';
+        return '';
+    }
 
-if (!rawItems || rawItems.length === 0) return null;
+    _countValidBatchItems(items) {
+        return Array.isArray(items) ? items.filter(Boolean).length : 0;
+    }
 
-const mapped = new Array(originals.length);
-for (let i = 0; i < rawItems.length; i++) {
-const item = rawItems[i];
-let index = i + 1;
-let translation = '';
-let note = '';
+    _extractBatchTranslations(data, originals, allowPartial = false) {
+        if (!data) return null;
 
-if (typeof item === 'string') {
-translation = item;
-} else if (item && typeof item === 'object') {
-const rawIndex = item.index !== undefined ? item.index : (item.id !== undefined ? item.id : item.no);
-const parsedIndex = parseInt(rawIndex, 10);
-if (!isNaN(parsedIndex)) index = parsedIndex;
-translation = item.translation || item.text || item.result || item.target || item.chinese || item.content || '';
-note = item.note || item.annotation || item.comment || '';
-}
+        const rawItems = Array.isArray(data) ? data
+            : Array.isArray(data.translations) ? data.translations
+            : Array.isArray(data.items) ? data.items
+            : Array.isArray(data.results) ? data.results
+            : Array.isArray(data.lines) ? data.lines
+            : null;
 
-translation = this._cleanTranslationText(translation);
-if (!translation || index < 1 || index > originals.length) continue;
-const entry = { original: originals[index - 1], translation: translation };
-if (note && note.trim()) entry.note = note.trim();
-mapped[index - 1] = entry;
-}
+        if (!rawItems || rawItems.length === 0) return null;
 
-return mapped.filter(Boolean).length === originals.length ? mapped : null;
-}
+        const mapped = new Array(originals.length);
+        for (let i = 0; i < rawItems.length; i++) {
+            const item = rawItems[i];
+            let index = i + 1;
+            let translation = '';
+            let note = '';
 
-    _extractBatchTranslationsFromText(text, originals) {
+            if (typeof item === 'string') {
+                translation = item;
+            } else if (item && typeof item === 'object') {
+                const rawIndex = item.index !== undefined ? item.index : (item.id !== undefined ? item.id : item.no);
+                const parsedIndex = parseInt(rawIndex, 10);
+                if (!isNaN(parsedIndex)) index = parsedIndex;
+                translation = item.translation || item.text || item.result || item.target || item.chinese || item.content || '';
+                note = item.note || item.annotation || item.comment || '';
+            }
+
+            translation = this._cleanTranslationText(translation);
+            if (!translation || index < 1 || index > originals.length) continue;
+            const entry = { original: originals[index - 1], translation: translation };
+            if (note && note.trim()) entry.note = note.trim();
+            mapped[index - 1] = entry;
+        }
+
+        const validCount = mapped.filter(Boolean).length;
+        if (validCount === 0) return null;
+        return (allowPartial || validCount === originals.length) ? mapped : null;
+    }
+
+    _extractBatchTranslationsFromText(text, originals, allowPartial = false) {
         const normalizedText = String(text || '').replace(/\r\n/g, '\n').replace(/\\n/g, '\n').trim();
         const mapped = new Array(originals.length);
         const groups = [];
@@ -843,7 +945,8 @@ return mapped.filter(Boolean).length === originals.length ? mapped : null;
             }
         }
 
-        if (mapped.filter(Boolean).length === originals.length) return mapped;
+        const validCount = mapped.filter(Boolean).length;
+        if (validCount === originals.length) return mapped;
 
         const compactLines = normalizedText.split(/\n+/).map(line => line.trim()).filter(Boolean);
         if (compactLines.length === originals.length) {
@@ -860,22 +963,68 @@ return mapped.filter(Boolean).length === originals.length ? mapped : null;
             }];
         }
 
+        if (allowPartial && validCount > 0) return mapped;
         return null;
     }
 
-    _parseBatchTranslationResponse(response, originals) {
+    _parseBatchTranslationResponse(response, originals, meta = {}) {
         const split = this._splitResponseAndTerms(response);
         const data = Utils.parseJSON(split.body);
-        const items = this._extractBatchTranslations(data, originals) || this._extractBatchTranslationsFromText(split.body, originals);
+        const jsonItems = this._extractBatchTranslations(data, originals, true);
+        const textItems = this._extractBatchTranslationsFromText(split.body, originals, true);
+        const jsonCount = this._countValidBatchItems(jsonItems);
+        const textCount = this._countValidBatchItems(textItems);
+        let items = null;
+        let parseSource = 'none';
         let newTerms = split.newTerms;
+
+        if (jsonCount === originals.length && Array.isArray(jsonItems)) {
+            items = jsonItems;
+            parseSource = 'json';
+        } else if (textCount === originals.length && Array.isArray(textItems)) {
+            items = textItems;
+            parseSource = 'text';
+        } else if (jsonCount > 0 || textCount > 0) {
+            parseSource = jsonCount >= textCount ? 'json_partial' : 'text_partial';
+        }
 
         if (data && typeof data === 'object') {
             newTerms = this._normalizeTerms(data.newTerms || data.terms || data.glossary || newTerms);
         }
 
         if (!items || items.length !== originals.length) {
-            const error = new Error('批量译文数量与原句不一致');
+            const finishReason = String(meta.finishReason || '').trim();
+            const responseBody = String(split.body || '').trim();
+            const actualCount = Math.max(jsonCount, textCount);
+            const finishHint = this._describeBatchFinishReason(finishReason);
+            const details = {
+                expectedCount: originals.length,
+                actualCount: actualCount,
+                jsonCount: jsonCount,
+                textCount: textCount,
+                parseSource: parseSource,
+                finishReason: finishReason,
+                responseLength: responseBody.length,
+                responsePreview: this._trimBatchResponsePreview(responseBody),
+                requestId: meta.requestId,
+                usage: meta.usage || null,
+                maxTokens: meta.maxTokens,
+                finishHint: finishHint
+            };
+            const messageParts = [
+                '批量译文数量与原句不一致',
+                `期望${details.expectedCount}条`,
+                `实际${details.actualCount}条`,
+                `来源${details.parseSource}`
+            ];
+            if (details.finishReason) messageParts.push(`finish_reason=${details.finishReason}`);
+            if (details.maxTokens) messageParts.push(`maxTokens=${details.maxTokens}`);
+            if (details.responseLength) messageParts.push(`响应长度=${details.responseLength}`);
+            if (details.finishHint) messageParts.push(details.finishHint);
+
+            const error = new Error(messageParts.join('；'));
             error._batchParseFailure = true;
+            error._batchDetails = details;
             throw error;
         }
 
