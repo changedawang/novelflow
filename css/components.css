@@ -93,6 +93,8 @@
 .sent-row:hover{background:var(--accent-light)}
 .sent-row.current{background:rgba(139,69,19,.08);border-left:3px solid var(--accent);padding-left:5px}
 .sent-row.failed{color:var(--danger);opacity:.7}
+.sent-row-main{white-space:pre-wrap}
+.sent-row-note{font-size:.78em;color:#6b5b4f;background:linear-gradient(135deg,rgba(139,69,19,.08),rgba(139,69,19,.04));border-left:3px solid rgba(139,69,19,.4);padding:6px 10px;margin:6px 0 0 0;border-radius:0 6px 6px 0;line-height:1.5}
 .gl-toolbar{display:flex;gap:var(--sp-sm);margin-bottom:var(--sp-md);flex-wrap:wrap}
 .gl-toolbar input{flex:1;min-width:120px}
 .gl-table{width:100%;border-collapse:collapse;font-family:var(--font-ui);font-size:.82rem}

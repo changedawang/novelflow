@@ -147,6 +147,7 @@ class TranslationEngine {
                         sentenceIndex: sentenceIndex,
                         original: sentence,
                         translation: result.translation,
+                        note: result.note || '',
                         completed: this.completedSentences,
                         total: this.totalSentences,
                         percent: Math.round(this.completedSentences / this.totalSentences * 100),
@@ -346,8 +347,10 @@ class TranslationEngine {
 
         if (sentences.length === 1) {
             const result = await this._translateSentence(sentences[0], context);
+            const item = { original: result.original, translation: result.translation };
+            if (result.note && String(result.note).trim()) item.note = String(result.note).trim();
             return {
-                items: [{ original: result.original, translation: result.translation }],
+                items: [item],
                 newTerms: result.newTerms || [],
             };
         }
@@ -440,7 +443,9 @@ class TranslationEngine {
                 relevantGlossary: relevantTerms,
             });
 
-            items.push({ original: sentence, translation: result.translation });
+            const item = { original: sentence, translation: result.translation };
+            if (result.note && String(result.note).trim()) item.note = String(result.note).trim();
+            items.push(item);
 
             if (result.newTerms && result.newTerms.length > 0) {
                 newTerms = newTerms.concat(result.newTerms);
@@ -493,11 +498,13 @@ class TranslationEngine {
         const style = this.styleProfile;
         const styleSum = style?.style_summary || '忠实流畅';
         const typeTag = { '奇幻': '史诗', '科幻': '精确', '文学': '细腻', '言情': '温柔' }[this.config.novelType] || '';
-        const systemPrompt = `文学翻译→${this.config.targetLang}。风格:${styleSum}${typeTag ? '/'+typeTag : ''}。遵循术语表,保持一致。`;
+        const systemPrompt = `文学翻译→${this.config.targetLang}。风格:${styleSum}${typeTag ? '/'+typeTag : ''}。遵循术语表,保持一致。严格输出JSON。`;
 
         const parts = this._buildPromptContextParts(context, sentence.length);
         parts.push(`[译] ${sentence}`);
-        parts.push('先充分分析原句与上下文，再输出最终译文。不要把思考过程写进译文正文。新名词另起行:NEW_TERMS:[{"original":"","translation":"","category":""}]');
+        parts.push('先充分分析原句与上下文，再输出最终结果。不要把思考过程写进translation或note。');
+        parts.push('如遇书名、典故、俚语、双关或需要背景知识才能理解的内容，可用note字段补充15字以内简短注释；普通句子省略note。');
+        parts.push('只输出JSON:{"translation":"","note":"可选,15字内注释","newTerms":[{"original":"","translation":"","category":"character|location|item|other"}]}');
 
         return [
             { role: 'system', content: systemPrompt },
@@ -872,6 +879,24 @@ return mapped.filter(Boolean).length === originals.length ? mapped : null;
 
     _parseTranslationResponse(response, original) {
         const parsed = this._splitResponseAndTerms(response);
+        const data = Utils.parseJSON(parsed.body);
+
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+            const translation = this._cleanTranslationText(
+                data.translation || data.text || data.result || data.target || data.chinese || data.content || data.final || ''
+            );
+            let newTerms = parsed.newTerms;
+            if (data.newTerms || data.terms || data.glossary) {
+                newTerms = this._normalizeTerms(data.newTerms || data.terms || data.glossary);
+            }
+            if (translation) {
+                const result = { original, translation, newTerms };
+                const note = data.note || data.annotation || data.comment || '';
+                if (note && String(note).trim()) result.note = String(note).trim();
+                return result;
+            }
+        }
+
         return { original, translation: this._cleanTranslationText(parsed.body), newTerms: parsed.newTerms };
     }
 

@@ -23,6 +23,10 @@ class UIController {
         this._optimizeBookId = null;
         this._optimizeResumeResolve = null;
         this._optimizeReturnChIdx = null;
+        this._autoOptimizeQueue = [];
+        this._autoOptimizeRunning = false;
+        this._autoOptimizeEngine = null;
+        this._autoOptimizeCurrent = null;
         this._logCount = 0;
         this._init();
     }
@@ -456,9 +460,14 @@ this._openReader(book);
         }
         return this.translationResults[chapterIndex];
     }
-    _storeSentenceResult(chapterIndex, sentenceIndex, original, translation, failed) {
+    _storeSentenceResult(chapterIndex, sentenceIndex, original, translation, failed, note) {
         const chapter = this._ensureResultChapter(chapterIndex);
-        chapter.sentences[sentenceIndex] = { original: original, translation: translation, failed: !!failed };
+        chapter.sentences[sentenceIndex] = {
+            original: original,
+            translation: translation,
+            failed: !!failed,
+            note: typeof note === 'string' ? note : ''
+        };
     }
     _mergeEngineResults(results) {
         (results || []).forEach((ch, idx) => {
@@ -466,7 +475,18 @@ this._openReader(book);
             const chapterIndex = meta ? meta.originalChapterIndex : idx;
             const startSentenceIndex = meta ? meta.startSentenceIndex : 0;
             const target = this._ensureResultChapter(chapterIndex);
+            const preserveOptimized = !!target.optimized &&
+                Array.isArray(target.sentences) &&
+                target.sentences.some(sent => sent && sent.translation);
+
             target.chapterIndex = chapterIndex;
+
+            if (preserveOptimized) {
+                if (!target.title) target.title = ch.title || target.title;
+                if (!target.summary && ch.summary) target.summary = ch.summary;
+                return;
+            }
+
             target.title = ch.title || target.title;
             if (ch.summary) target.summary = ch.summary;
             (ch.sentences || []).forEach((sent, sentIdx) => {
@@ -479,8 +499,22 @@ this._openReader(book);
             chapterIndex: ch.chapterIndex,
             title: ch.title,
             sentences: (ch.sentences || []).filter(Boolean),
-            summary: ch.summary || ''
+            summary: ch.summary || '',
+            optimized: !!ch.optimized,
+            optimizedAt: ch.optimizedAt || null
         }));
+    }
+    _refreshWorkChapterRows(chapterIndex) {
+        const sourceChapter = this.chapters[chapterIndex] || { sentences: [] };
+        const translatedChapter = this.translationResults[chapterIndex] || { sentences: [] };
+        const translatedSentences = translatedChapter.sentences || [];
+        const startFlatIndex = this._getSentenceOffset(chapterIndex);
+
+        for (let sentIdx = 0; sentIdx < sourceChapter.sentences.length; sentIdx++) {
+            const source = sourceChapter.sentences[sentIdx];
+            const existing = translatedSentences[sentIdx];
+            this._addSentRow(source, existing ? existing.translation : '', existing ? existing.failed : false, startFlatIndex + sentIdx, existing ? existing.note : '');
+        }
     }
     _restoreEngineChapterSummaries(chapterSummaries) {
         const shifted = {};
@@ -520,7 +554,7 @@ this._openReader(book);
             for (let sentIdx = 0; sentIdx < sourceChapter.sentences.length; sentIdx++) {
                 const source = sourceChapter.sentences[sentIdx];
                 const existing = translatedSentences[sentIdx];
-                this._addSentRow(source, existing ? existing.translation : '', existing ? existing.failed : false, flatIndex);
+                this._addSentRow(source, existing ? existing.translation : '', existing ? existing.failed : false, flatIndex, existing ? existing.note : '');
                 flatIndex += 1;
             }
         }
@@ -698,8 +732,8 @@ this._showPage('work');
                 const completed = Math.min(total, (this._progressOffset || 0) + (typeof d.completed === 'number' ? d.completed : (this.engine ? this.engine.completedSentences : 0)));
                 const percent = total > 0 ? Math.round(completed / total * 100) : 0;
                 const failed = !!d.failed;
-                this._storeSentenceResult(pos.chapterIndex, pos.sentenceIndex, d.original, d.translation, failed);
-                this._addSentRow(d.original, d.translation, failed, pos.flatIndex);
+                this._storeSentenceResult(pos.chapterIndex, pos.sentenceIndex, d.original, d.translation, failed, d.note || '');
+                this._addSentRow(d.original, d.translation, failed, pos.flatIndex, d.note || '');
                 document.getElementById('progress-bar').style.width = percent+'%';
                 document.getElementById('prog-label').textContent = completed+'/'+total;
                 document.getElementById('prog-pct').textContent = percent+'%';
@@ -717,9 +751,8 @@ this._showPage('work');
                     if (this.engine.chapterSummaries[d.chapterIndex] !== undefined) {
                         chapter.summary = this.engine.chapterSummaries[d.chapterIndex];
                     }
-                    // 自动优化：章节翻译完成后自动优化该章节
-                    if (this.settings.autoOptimize && !this._optimizing) {
-                        this._autoOptimizeChapter(chapterIndex);
+                    if (this.settings.autoOptimize && !this._isOptimizeMode) {
+                        this._enqueueAutoOptimizeChapter(book.id, chapterIndex);
                     }
                 }
                 this._saveProgress(null);
@@ -838,30 +871,140 @@ this._showPage('work');
         }
     }
 
-    // 自动优化单个章节（翻译完成后自动触发）
-    async _autoOptimizeChapter(chapterIndex) {
-        const book = this._getBook(this.currentBookId);
-        if (!book || !this.engine) return;
-        
-        const results = this._materializeResults();
-        if (!results || !results[chapterIndex]) return;
-        
-        this._optimizing = true;
-        this._addInfoLog(`自动优化: 第${chapterIndex + 1}章开始...`);
-        
+    _enqueueAutoOptimizeChapter(bookId, chapterIndex) {
+        if (!bookId || !Number.isInteger(chapterIndex) || chapterIndex < 0) return;
+        if (this._autoOptimizeQueue.some(item => item.bookId === bookId && item.chapterIndex === chapterIndex)) return;
+        if (this._autoOptimizeCurrent && this._autoOptimizeCurrent.bookId === bookId && this._autoOptimizeCurrent.chapterIndex === chapterIndex) return;
+        this._autoOptimizeQueue.push({ bookId, chapterIndex });
+        this._drainAutoOptimizeQueue();
+    }
+
+    async _drainAutoOptimizeQueue() {
+        if (this._autoOptimizeRunning || this._isOptimizeMode) return;
+        this._autoOptimizeRunning = true;
+
         try {
-            const chapter = results[chapterIndex];
-            const optimized = await this.engine.optimizeSingleChapter(chapter, chapterIndex);
-            if (optimized) {
-                results[chapterIndex] = optimized;
-                Utils.saveLocal(`results-${book.id}`, results);
-                this._addInfoLog(`自动优化: 第${chapterIndex + 1}章完成`);
+            while (this._autoOptimizeQueue.length > 0 && !this._isOptimizeMode) {
+                const task = this._autoOptimizeQueue.shift();
+                if (!task) continue;
+                await this._autoOptimizeChapter(task.bookId, task.chapterIndex);
             }
+        } finally {
+            this._autoOptimizeRunning = false;
+            if (!this._autoOptimizeCurrent) this._autoOptimizeEngine = null;
+        }
+    }
+
+    _cancelAutoOptimizeForBook(bookId) {
+        if (!bookId) return;
+        this._autoOptimizeQueue = this._autoOptimizeQueue.filter(item => item.bookId !== bookId);
+        if (this._autoOptimizeCurrent && this._autoOptimizeCurrent.bookId === bookId && this._autoOptimizeEngine) {
+            this._autoOptimizeEngine.cancel();
+        }
+    }
+
+    _createAutoOptimizeEngine(book) {
+        const model = this._ensureSettingsModel();
+        if (!model || !this.settings.apiKeys || this.settings.apiKeys.length === 0) return null;
+
+        const s = this.settings;
+        const engine = new TranslationEngine({
+            api: { apiKeys: s.apiKeys, model, baseUrl: s.baseUrl, provider: s.provider },
+            targetLang: book.targetLang || '简体中文',
+            translationReasoningEffort: s.translationReasoningEffort || 'medium',
+            optimizeReasoningEffort: s.optimizeReasoningEffort || 'high',
+            enableReasoningTrace: s.enableReasoningTrace !== false,
+            streamReasoningTrace: s.streamReasoningTrace !== false && s.enableReasoningTrace !== false,
+        });
+
+        const glossaryData = (this.engine && this.currentBookId === book.id) ? this.engine.glossary.toJSON() : book.glossary;
+        if (glossaryData) engine.glossary.fromJSON(glossaryData);
+
+        if (this.engine && this.currentBookId === book.id) {
+            if (this.engine.styleProfile) engine.styleProfile = this.engine.styleProfile;
+            else if (book.styleProfile) engine.styleProfile = book.styleProfile;
+            engine.globalSummary = this.engine.globalSummary || book.globalSummary || '';
+            engine.chapterSummaries = this._getPersistedChapterSummaries();
+        } else {
+            if (book.styleProfile) engine.styleProfile = book.styleProfile;
+            engine.globalSummary = book.globalSummary || '';
+            engine.chapterSummaries = book.chapterSummaries || {};
+        }
+
+        engine.on('apiCall', (d) => this._updateApiLog(d));
+        return engine;
+    }
+
+    async _autoOptimizeChapter(bookId, chapterIndex) {
+        const book = this._getBook(bookId);
+        if (!book) return;
+
+        const activeBook = this.currentBookId === bookId;
+        const sourceChapters = activeBook && Array.isArray(this.chapters)
+            ? this.chapters
+            : Utils.loadLocal(`chapters-${bookId}`, book.chapters || []);
+        const results = activeBook
+            ? this.translationResults
+            : this._cloneResults(Utils.loadLocal(`results-${bookId}`, book.results || []));
+        const chapter = results[chapterIndex];
+
+        if (!chapter || !Array.isArray(chapter.sentences) || chapter.sentences.length === 0) return;
+
+        const optimizeEngine = this._createAutoOptimizeEngine(book);
+        if (!optimizeEngine) {
+            this._addInfoLog('自动优化跳过：缺少有效模型或API配置');
+            return;
+        }
+
+        this._autoOptimizeEngine = optimizeEngine;
+        this._autoOptimizeCurrent = { bookId, chapterIndex };
+        this._addInfoLog(`自动优化: 第${chapterIndex + 1}章开始...`);
+
+        try {
+            const optimized = await optimizeEngine.optimizeSingleChapter(this._cloneResults([chapter])[0], chapterIndex);
+            if (!optimized) return;
+
+            const currentChapter = activeBook ? this._ensureResultChapter(chapterIndex) : (results[chapterIndex] || chapter);
+            const savedChapter = {
+                ...currentChapter,
+                ...optimized,
+                chapterIndex: chapterIndex,
+                title: optimized.title || currentChapter.title || sourceChapters[chapterIndex]?.title || `第${chapterIndex + 1}章`,
+                summary: optimized.summary || currentChapter.summary || '',
+                sentences: Array.isArray(optimized.sentences) ? optimized.sentences : (currentChapter.sentences || []),
+                optimized: true,
+                optimizedAt: optimized.optimizedAt || Date.now()
+            };
+
+            let persistedResults;
+            if (activeBook) {
+                this.translationResults[chapterIndex] = savedChapter;
+                persistedResults = this._materializeResults();
+            } else {
+                results[chapterIndex] = savedChapter;
+                persistedResults = results;
+            }
+
+            book.results = this._cloneResults(persistedResults);
+            book.updatedAt = Date.now();
+            Utils.saveLocal(`results-${book.id}`, book.results);
+            this._saveBook(book);
+
+            if (activeBook) {
+                this._refreshWorkChapterRows(chapterIndex);
+                this._updateLiveReaderOnProgress();
+            }
+
+            this._addInfoLog(`自动优化: 第${chapterIndex + 1}章完成`);
         } catch (e) {
+            if (e?.message === 'CANCELLED') return;
             console.warn('自动优化失败:', e);
             this._addInfoLog(`自动优化失败: ${e.message}`);
         } finally {
-            this._optimizing = false;
+            if (this._autoOptimizeEngine === optimizeEngine) this._autoOptimizeEngine = null;
+            if (this._autoOptimizeCurrent && this._autoOptimizeCurrent.bookId === bookId && this._autoOptimizeCurrent.chapterIndex === chapterIndex) {
+                this._autoOptimizeCurrent = null;
+            }
         }
     }
 
@@ -973,7 +1116,7 @@ this._showPage('work');
         for (let sentIdx = 0; sentIdx < sourceChapter.sentences.length; sentIdx++) {
             const source = sourceChapter.sentences[sentIdx];
             const existing = translatedSentences[sentIdx];
-            this._addSentRow(source, existing ? existing.translation : '', existing ? existing.failed : false, sentIdx);
+            this._addSentRow(source, existing ? existing.translation : '', existing ? existing.failed : false, sentIdx, existing ? existing.note : '');
         }
 
         this._autoScroll = prevAutoScroll;
@@ -999,7 +1142,7 @@ this._showPage('work');
             d.items.forEach((item, offset) => {
                 const sentIndex = startIndex + offset;
                 const source = this.chapters[d.chapterIndex]?.sentences?.[sentIndex] || item.original || '';
-                this._addSentRow(source, item.translation || '', !!item.failed, sentIndex);
+                this._addSentRow(source, item.translation || '', !!item.failed, sentIndex, item.note || '');
             });
         }
 
@@ -1007,7 +1150,7 @@ this._showPage('work');
     }
 
     async _startReaderOptimize() {
-        if (this._optimizing) {
+        if (this._optimizing || this._autoOptimizeRunning || this._autoOptimizeQueue.length > 0) {
             alert('当前已有优化任务正在进行');
             return;
         }
@@ -1399,6 +1542,7 @@ this._showPage('work');
     _onCancelled() {
         this._saveProgress(null);
         const book = this._getBook(this.currentBookId);
+        this._cancelAutoOptimizeForBook(this.currentBookId);
         if(book){ book.status='cancelled'; book.updatedAt=Date.now(); this._saveBook(book); }
         this._setDot('');
         document.getElementById('pause-bar').classList.remove('show');
@@ -1410,7 +1554,7 @@ this._showPage('work');
     }
 
     /* ── 工作台UI工具 ── */
-    _addSentRow(src, tgt, failed, rowIndex) {
+    _addSentRow(src, tgt, failed, rowIndex, note) {
         const srcList=document.getElementById('src-list'), tgtList=document.getElementById('tgt-list');
         let row = typeof rowIndex === 'number' ? this._workRows[rowIndex] : null;
         if (!row) {
@@ -1425,8 +1569,22 @@ this._showPage('work');
             else this._workRows.push(row);
         }
         row.src.textContent = src || '';
-        row.tgt.textContent = tgt || '';
         row.tgt.className = 'sent-row'+(failed?' failed':'');
+        row.tgt.innerHTML = '';
+
+        const main=document.createElement('div');
+        main.className='sent-row-main';
+        main.textContent = tgt || '';
+        row.tgt.appendChild(main);
+
+        const noteText = typeof note === 'string' ? note.trim() : '';
+        if (noteText) {
+            const noteEl=document.createElement('div');
+            noteEl.className='sent-row-note';
+            noteEl.textContent = '📝 ' + noteText;
+            row.tgt.appendChild(noteEl);
+        }
+
         if(this._autoScroll){
             if (typeof rowIndex === 'number') {
                 row.src.scrollIntoView({ block:'nearest' });
@@ -1537,6 +1695,7 @@ this._showPage('work');
             if (!confirm('确定取消翻译？')) return;
             const bk = this._getBook(this.currentBookId);
             if (this.engine) this.engine.cancel();
+            this._cancelAutoOptimizeForBook(this.currentBookId);
             if (bk) {
                 bk.status = 'cancelled';
                 bk.updatedAt = Date.now();

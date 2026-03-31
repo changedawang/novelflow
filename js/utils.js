@@ -34,16 +34,93 @@ const Utils = {
 
     /** 安全解析JSON（从可能包含markdown代码块的文本中提取） */
     parseJSON(text) {
-        // 尝试直接解析
-        try { return JSON.parse(text); } catch(e) {}
-        // 去除markdown代码块
-        const cleaned = text.replace(/```json?\s*/g, '').replace(/```\s*/g, '');
-        try { return JSON.parse(cleaned); } catch(e) {}
-        // 提取第一个{...}或[...]
-        const objMatch = cleaned.match(/\{[\s\S]*\}/);
-        if (objMatch) try { return JSON.parse(objMatch[0]); } catch(e) {}
-        const arrMatch = cleaned.match(/\[[\s\S]*\]/);
-        if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch(e) {}
+        if (text === undefined || text === null) return null;
+        if (typeof text === 'object') return text;
+
+        const raw = String(text).trim();
+        if (!raw) return null;
+
+        const tryParse = (value) => {
+            if (!value) return null;
+            try { return JSON.parse(value); } catch(e) { return null; }
+        };
+
+        const pushCandidate = (list, value) => {
+            const normalized = String(value || '').trim();
+            if (normalized && !list.includes(normalized)) list.push(normalized);
+        };
+
+        const extractBalanced = (value) => {
+            const snippets = [];
+            let start = -1;
+            let depth = 0;
+            let quote = '';
+            let escaped = false;
+
+            for (let i = 0; i < value.length; i++) {
+                const ch = value[i];
+
+                if (quote) {
+                    if (escaped) {
+                        escaped = false;
+                        continue;
+                    }
+                    if (ch === '\\') {
+                        escaped = true;
+                        continue;
+                    }
+                    if (ch === quote) {
+                        quote = '';
+                    }
+                    continue;
+                }
+
+                if (ch === '"' || ch === "'") {
+                    quote = ch;
+                    continue;
+                }
+
+                if (ch === '{' || ch === '[') {
+                    if (depth === 0) start = i;
+                    depth += 1;
+                    continue;
+                }
+
+                if (ch === '}' || ch === ']') {
+                    if (depth <= 0) continue;
+                    depth -= 1;
+                    if (depth === 0 && start >= 0) {
+                        snippets.push(value.slice(start, i + 1));
+                        start = -1;
+                    }
+                }
+            }
+
+            return snippets;
+        };
+
+        const direct = tryParse(raw);
+        if (direct !== null) return direct;
+
+        const candidates = [];
+        pushCandidate(candidates, raw.replace(/^\uFEFF/, ''));
+        pushCandidate(candidates, raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, ''));
+        (raw.match(/```(?:json)?\s*[\s\S]*?```/gi) || []).forEach(block => {
+            pushCandidate(candidates, block.replace(/```json?\s*/gi, '').replace(/```\s*/g, ''));
+        });
+
+        for (let i = 0; i < candidates.length; i++) {
+            const candidate = candidates[i];
+            const parsed = tryParse(candidate);
+            if (parsed !== null) return parsed;
+
+            const snippets = extractBalanced(candidate);
+            for (let j = 0; j < snippets.length; j++) {
+                const snippetParsed = tryParse(snippets[j]);
+                if (snippetParsed !== null) return snippetParsed;
+            }
+        }
+
         return null;
     },
 
