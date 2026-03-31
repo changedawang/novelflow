@@ -540,8 +540,13 @@ return [
 }
 
     _estimateBatchMaxTokens(sentences) {
-        const totalChars = sentences.join(' ').length;
-        return Math.min(1200, Math.max(220, Math.ceil(totalChars * 0.9)));
+        // 每句翻译约需40-60 tokens（含JSON结构开销）
+        // 45句 * 50 = 2250，再加JSON框架约200 tokens
+        const perSentenceTokens = 55;
+        const jsonOverhead = 200;
+        const estimated = sentences.length * perSentenceTokens + jsonOverhead;
+        // 下限400（小批量），上限6000（大批量不截断）
+        return Math.min(6000, Math.max(400, estimated));
     }
 
     _normalizeReasoningEffort(value, fallback = 'medium') {
