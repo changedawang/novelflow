@@ -626,7 +626,7 @@ return [
     }
 
     _getReasoningEffort(taskType) {
-        const fallback = taskType === 'optimize' ? 'high' : 'medium';
+        const fallback = taskType === 'optimize' ? 'low' : 'medium';
         const raw = taskType === 'optimize'
             ? this.config.optimizeReasoningEffort
             : this.config.translationReasoningEffort;
@@ -1309,53 +1309,810 @@ ${pairsText}${contextAfter}
         const total = pairs.length;
         const startTime = Date.now();
         const summaries = this._collectOptimizeSummaries(chapter, chapterIndex);
+        const optimizedSentences = pairs.map(p => this._makeOptimizeSentenceEntry(p));
 
         this._emit('optimizeProgress', {
             chapterIndex,
             done: 0,
             total,
-            message: '准备整章润色...'
+            message: '生成章节优化方案...'
         });
 
-        const optimizedSentences = await this._optimizeChapterFull(
-            pairs,
-            chapter.title,
-            summaries
-        );
-
-        this._emit('optimizeChunk', {
-            chapterIndex,
-            startIndex: 0,
-            items: optimizedSentences
-        });
+        const plan = await this._planOptimizeChapter(pairs, chapter.title, summaries);
+        const chunkRanges = this._buildOptimizeChunkRanges(pairs, plan);
 
         this._emit('optimizeProgress', {
             chapterIndex,
-            done: total,
+            done: 0,
             total,
-            message: `优化进度: ${total}/${total}`
+            message: `章节方案已生成，分${chunkRanges.length}块执行`
         });
 
-        this._emit('optimizeBatch', {
-            type: 'optimize',
-            chapterIndex,
-            title: chapter.title,
-            inputTokens: this._lastInputTokens || 0,
-            outputTokens: this._lastOutputTokens || 0,
-            duration: Date.now() - startTime,
-            batchSize: total,
-            preview: optimizedSentences[0]?.translation?.slice(0, 80) || '',
-            done: total,
-            total
-        });
+        let done = 0;
+        for (let i = 0; i < chunkRanges.length; i++) {
+            await this._checkPauseCancel();
+            const range = chunkRanges[i];
+            const chunkStartTime = Date.now();
+            const items = await this._optimizeChunkRecursive(
+                optimizedSentences,
+                pairs,
+                range.start,
+                range.end,
+                plan,
+                chapter.title,
+                summaries
+            );
+
+            this._emit('optimizeChunk', {
+                chapterIndex,
+                startIndex: range.start,
+                items
+            });
+
+            done = range.end + 1;
+            this._emit('optimizeProgress', {
+                chapterIndex,
+                done,
+                total,
+                message: `优化进度: ${done}/${total}`
+            });
+
+            this._emit('optimizeBatch', {
+                type: 'optimize',
+                chapterIndex,
+                title: chapter.title,
+                inputTokens: this._lastInputTokens || 0,
+                outputTokens: this._lastOutputTokens || 0,
+                duration: Date.now() - chunkStartTime,
+                batchSize: range.end - range.start + 1,
+                preview: items[0]?.translation?.slice(0, 80) || '',
+                done,
+                total
+            });
+        }
 
         return {
             ...chapter,
             summary: summaries.current || chapter.summary || '',
-            sentences: optimizedSentences,
+            sentences: optimizedSentences.map(s => this._makeOptimizeSentenceEntry(s)),
             optimized: true,
             optimizedAt: Date.now()
         };
+    }
+
+    _makeOptimizeSentenceEntry(pair) {
+        const entry = {
+            original: pair && pair.original ? pair.original : '',
+            translation: this._cleanTranslationText(pair && pair.translation ? pair.translation : '')
+        };
+        const noteText = typeof (pair && pair.note) === 'string' ? pair.note.trim() : '';
+        if (noteText) entry.note = noteText;
+        return entry;
+    }
+
+    _normalizeOptimizePlanRange(item, maxIndex) {
+        if (item === null || item === undefined) return null;
+
+        let start = null;
+        let end = null;
+        let reason = '';
+
+        if (typeof item === 'number' || typeof item === 'string') {
+            start = item;
+            end = item;
+        } else if (item && typeof item === 'object') {
+            start = item.start !== undefined ? item.start : (item.from !== undefined ? item.from : (item.index !== undefined ? item.index : item.id));
+            end = item.end !== undefined ? item.end : (item.to !== undefined ? item.to : (item.index !== undefined ? item.index : item.id));
+            reason = String(item.reason || item.note || item.label || '').trim();
+        }
+
+        start = parseInt(start, 10);
+        end = parseInt(end, 10);
+        if (isNaN(start) && !isNaN(end)) start = end;
+        if (isNaN(end) && !isNaN(start)) end = start;
+        if (isNaN(start) || isNaN(end)) return null;
+
+        start = Math.max(1, Math.min(maxIndex, start));
+        end = Math.max(1, Math.min(maxIndex, end));
+        if (start > end) {
+            const temp = start;
+            start = end;
+            end = temp;
+        }
+
+        return { start, end, reason };
+    }
+
+    _buildFallbackOptimizePlan() {
+        const protectedTerms = (this.glossary.entries || [])
+            .filter(e => e && e.original && e.translation)
+            .slice(0, 40)
+            .map(e => `${e.original} → ${e.translation}`);
+
+        return {
+            chapterGoal: '统一术语与口吻，消除明显翻译腔，在忠实原意的前提下提升中文可读性。',
+            rewriteRules: [
+                '优先修正误译、漏译、增译与指代错误',
+                '对白口吻和叙述节奏要自然，避免生硬直译',
+                '普通句子不要滥加注释，必要时只给简短注释'
+            ],
+            protectedTerms,
+            noteTargets: [],
+            riskRanges: [],
+            doNot: [
+                '不要改变情节事实和人物关系',
+                '不要擅自扩写或删减关键信息',
+                '不要破坏术语一致性和上下文口吻'
+            ]
+        };
+    }
+
+    _normalizeOptimizePlan(data, pairs) {
+        const fallback = this._buildFallbackOptimizePlan();
+        if (!data || typeof data !== 'object') return fallback;
+
+        const normalizeList = (value, limit = 8) => {
+            if (!Array.isArray(value)) return [];
+            return value.map(item => String(item || '').trim()).filter(Boolean).slice(0, limit);
+        };
+
+        const normalizeTerms = (value) => {
+            if (!Array.isArray(value)) return fallback.protectedTerms;
+            const terms = value.map(item => {
+                if (typeof item === 'string') return item.trim();
+                if (item && typeof item === 'object') {
+                    const original = String(item.original || item.source || item.term || '').trim();
+                    const translation = String(item.translation || item.target || item.value || '').trim();
+                    if (original && translation) return `${original} → ${translation}`;
+                    return original || translation || '';
+                }
+                return '';
+            }).filter(Boolean).slice(0, 40);
+            return terms.length ? terms : fallback.protectedTerms;
+        };
+
+        const maxIndex = Array.isArray(pairs) ? pairs.length : 0;
+        const rewriteRules = normalizeList(data.rewriteRules || data.rules, 8);
+        const doNot = normalizeList(data.doNot || data.prohibitions || data.avoid, 8);
+        const noteTargets = Array.isArray(data.noteTargets)
+            ? data.noteTargets.map(item => this._normalizeOptimizePlanRange(item, maxIndex)).filter(Boolean).slice(0, 24)
+            : [];
+        const riskRanges = Array.isArray(data.riskRanges)
+            ? data.riskRanges.map(item => this._normalizeOptimizePlanRange(item, maxIndex)).filter(Boolean).slice(0, 24)
+            : [];
+
+        return {
+            chapterGoal: String(data.chapterGoal || data.goal || fallback.chapterGoal || '').trim() || fallback.chapterGoal,
+            rewriteRules: rewriteRules.length ? rewriteRules : fallback.rewriteRules,
+            protectedTerms: normalizeTerms(data.protectedTerms || data.lockedTerms || data.terms),
+            noteTargets,
+            riskRanges,
+            doNot: doNot.length ? doNot : fallback.doNot
+        };
+    }
+
+    async _planOptimizeChapter(pairs, chapterTitle, summaries) {
+        const fallback = this._buildFallbackOptimizePlan();
+        summaries = summaries || {};
+
+        const glossaryHint = (this.glossary.entries || [])
+            .filter(e => e && e.original && e.translation)
+            .map(e => `${e.original} → ${e.translation}`)
+            .join('\n');
+
+        const styleHint = this.styleProfile
+            ? `【文风特征】\n${this.styleProfile.style_summary || ''}\n语调: ${this.styleProfile.tone || ''}\n节奏: ${this.styleProfile.rhythm || ''}\n${Array.isArray(this.styleProfile.translation_guidelines) && this.styleProfile.translation_guidelines.length ? '翻译准则: ' + this.styleProfile.translation_guidelines.join('；') + '\n' : ''}\n`
+            : '';
+
+        const summarySections = [];
+        if (summaries.global) summarySections.push(`【全书摘要】\n${summaries.global}`);
+        if (Array.isArray(summaries.chapterSummaries) && summaries.chapterSummaries.length) {
+            summarySections.push(`【现有章节摘要】\n${summaries.chapterSummaries.join('\n')}`);
+        }
+        const summaryContext = summarySections.length ? summarySections.join('\n\n') + '\n\n' : '';
+
+        const pairsText = pairs.map((p, i) =>
+            `[${i + 1}]\n原文: ${p.original}\n当前译文: ${p.translation || ''}${p.note ? '\n现有注释: ' + p.note : ''}`
+        ).join('\n\n');
+
+        while (true) {
+            await this._checkPauseCancel();
+
+            const prompt = `你是资深文学翻译总编。先不要逐句改写，只为后续“小块执行”生成章节级优化计划。
+
+【任务】
+- 你会看到整章原文、当前译文、摘要、术语与文风信息
+- 请先判断这一章的主要优化目标、需要统一的术语、哪些位置可能要加注释、哪些连续句段风险较高
+- 不要输出逐句改写稿，不要写润色后的具体译文
+
+【输出JSON格式】
+{
+  "chapterGoal":"一句话概括本章优化目标",
+  "rewriteRules":["短规则1","短规则2"],
+  "protectedTerms":["原词 → 译名"],
+  "noteTargets":[{"start":12,"end":12,"reason":"为什么这里可能需要注释"}],
+  "riskRanges":[{"start":25,"end":30,"reason":"为什么这段要谨慎处理"}],
+  "doNot":["不要做的事1","不要做的事2"]
+}
+
+要求：
+- rewriteRules 写 3~8 条，尽量短
+- protectedTerms 只保留必须锁定的术语
+- noteTargets 和 riskRanges 使用绝对句号索引，范围尽量短
+- 没有就返回空数组
+- 只输出 JSON，不要额外说明
+
+${chapterTitle ? `【当前章节】\n${chapterTitle}\n\n` : ''}${summaryContext}${styleHint}${glossaryHint ? `【术语表】\n${glossaryHint}\n\n` : ''}【整章对照】
+${pairsText}`;
+
+            try {
+                const res = await this._chatWithTrace([{ role: 'user', content: prompt }], {
+                    type: 'optimize',
+                    batch: pairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    temperature: 0.2,
+                    maxTokens: 1800,
+                    reasoningEffort: this._getReasoningEffort('optimize'),
+                    useStream: true
+                });
+
+                this._lastInputTokens = res.usage?.prompt_tokens || 0;
+                this._lastOutputTokens = res.usage?.completion_tokens || 0;
+                this.tokensInput += this._lastInputTokens;
+                this.tokensOutput += this._lastOutputTokens;
+
+                const parsed = Utils.parseJSON(String(res.content || ''));
+                return this._normalizeOptimizePlan(parsed, pairs);
+            } catch (e) {
+                if (this._cancelled) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'cancelled',
+                        batch: pairs.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已取消'
+                    });
+                    throw new Error('CANCELLED');
+                }
+                if (this._paused || this._isRequestAbortedError(e)) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'paused',
+                        batch: pairs.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已暂停'
+                    });
+                    await this._checkPauseCancel();
+                    continue;
+                }
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: 'error',
+                    batch: pairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    message: e.message || '未知错误'
+                });
+                console.warn('章节优化计划生成失败，使用兜底计划:', e);
+                return fallback;
+            }
+        }
+    }
+
+    _rangeOverlapsOptimizePlan(start, end, ranges) {
+        return Array.isArray(ranges) && ranges.some(item => item && item.end >= start && item.start <= end);
+    }
+
+    _estimateOptimizePairWeight(pair) {
+        return String(pair && pair.original ? pair.original : '').length
+            + String(pair && pair.translation ? pair.translation : '').length
+            + String(pair && pair.note ? pair.note : '').length
+            + 24;
+    }
+
+    _scoreOptimizeBoundary(prev, next) {
+        const prevText = `${prev && prev.original ? prev.original : ''}\n${prev && prev.translation ? prev.translation : ''}`;
+        const nextText = `${next && next.original ? next.original : ''}\n${next && next.translation ? next.translation : ''}`;
+        let score = 0;
+
+        if (/\n\s*\n/.test(prevText) || /\n\s*\n/.test(nextText)) score += 3;
+        if (/[”"』」》】）)]\s*$/.test(prevText)) score += 1;
+        if (/^[“"'『「《【（(]/.test(nextText)) score += 1;
+        if (/^\s*(?:chapter|CHAPTER|第.+章|[\-—=*#]{2,})/.test(nextText)) score += 2;
+
+        return score;
+    }
+
+    _buildOptimizeChunkRanges(pairs, plan) {
+        if (!Array.isArray(pairs) || pairs.length === 0) return [];
+
+        const targetSize = 20;
+        const minSize = 12;
+        const maxSize = 20;
+        const riskyTargetSize = 14;
+        const riskyMaxSize = 15;
+        const maxChars = 6200;
+        const ranges = [];
+        let start = 0;
+
+        while (start < pairs.length) {
+            const startAbs = start + 1;
+            const startRisky = this._rangeOverlapsOptimizePlan(startAbs, startAbs, plan && plan.riskRanges)
+                || this._rangeOverlapsOptimizePlan(startAbs, startAbs, plan && plan.noteTargets);
+            const localTarget = startRisky ? riskyTargetSize : targetSize;
+            const localMax = startRisky ? riskyMaxSize : maxSize;
+            const remainingTotal = pairs.length - start;
+
+            if (remainingTotal <= localMax) {
+                ranges.push({ start, end: pairs.length - 1 });
+                break;
+            }
+
+            if (remainingTotal > localMax && remainingTotal < localMax + minSize) {
+                const leftSize = Math.ceil(remainingTotal / 2);
+                ranges.push({ start, end: start + leftSize - 1 });
+                start += leftSize;
+                continue;
+            }
+
+            let end = start;
+            let weight = 0;
+
+            while (end < pairs.length) {
+                const absStart = start + 1;
+                const absEnd = end + 1;
+                const nextSize = end - start + 1;
+                const nextWeight = weight + this._estimateOptimizePairWeight(pairs[end]);
+                const rangeRisky = this._rangeOverlapsOptimizePlan(absStart, absEnd, plan && plan.riskRanges)
+                    || this._rangeOverlapsOptimizePlan(absStart, absEnd, plan && plan.noteTargets);
+                const effectiveTarget = rangeRisky ? riskyTargetSize : localTarget;
+                const effectiveMax = rangeRisky ? riskyMaxSize : localMax;
+
+                if (nextSize > effectiveMax) break;
+                if (nextSize > 1 && nextWeight > maxChars && nextSize >= minSize) break;
+
+                weight = nextWeight;
+                end++;
+
+                const currentSize = end - start;
+                if (end >= pairs.length) break;
+                if (currentSize < effectiveTarget) continue;
+
+                const boundaryScore = this._scoreOptimizeBoundary(pairs[end - 1], pairs[end]);
+                if (boundaryScore > 0 || currentSize >= effectiveMax || weight >= maxChars * 0.88) {
+                    break;
+                }
+            }
+
+            if (end <= start) {
+                end = Math.min(pairs.length, start + localTarget);
+            }
+
+            ranges.push({ start, end: end - 1 });
+            start = end;
+        }
+
+        return ranges;
+    }
+
+    _formatOptimizePlanRangeList(ranges, absStart, absEnd) {
+        const relevant = (Array.isArray(ranges) ? ranges : [])
+            .filter(item => item && item.end >= absStart && item.start <= absEnd)
+            .slice(0, 10)
+            .map(item => {
+                const start = Math.max(absStart, item.start);
+                const end = Math.min(absEnd, item.end);
+                const label = start === end ? `[${start}]` : `[${start}-${end}]`;
+                return `- ${label}${item.reason ? ' ' + item.reason : ''}`;
+            });
+
+        return relevant.length ? relevant.join('\n') : '无';
+    }
+
+    _buildOptimizeChunkPrompt(chunkPairs, startIndex, plan, chapterTitle, summaries, bridgeContext, bridgeStartIndex) {
+        const absStart = startIndex + 1;
+        const absEnd = startIndex + chunkPairs.length;
+        const chapterGoal = plan && plan.chapterGoal ? plan.chapterGoal : '';
+        const rewriteRules = Array.isArray(plan && plan.rewriteRules) && plan.rewriteRules.length
+            ? plan.rewriteRules.map(rule => `- ${rule}`).join('\n')
+            : '- 忠实原意，中文自然';
+        const doNot = Array.isArray(plan && plan.doNot) && plan.doNot.length
+            ? plan.doNot.map(rule => `- ${rule}`).join('\n')
+            : '- 不要改变情节事实';
+        const protectedTerms = Array.isArray(plan && plan.protectedTerms) && plan.protectedTerms.length
+            ? plan.protectedTerms.slice(0, 20).map(term => `- ${term}`).join('\n')
+            : '无';
+        const noteTargets = this._formatOptimizePlanRangeList(plan && plan.noteTargets, absStart, absEnd);
+        const riskRanges = this._formatOptimizePlanRangeList(plan && plan.riskRanges, absStart, absEnd);
+        const currentSummary = summaries && summaries.current ? `【本章摘要】\n${summaries.current}\n\n` : '';
+        const styleHint = this.styleProfile && this.styleProfile.style_summary
+            ? `【文风特征】\n${this.styleProfile.style_summary}\n\n`
+            : '';
+        const contextText = Array.isArray(bridgeContext) && bridgeContext.length
+            ? `【上文衔接参考】\n${bridgeContext.map((item, idx) => {
+                const absIndex = bridgeStartIndex + idx + 1;
+                return `[${absIndex}] 原文: ${item.original}\n[${absIndex}] 已定稿: ${item.translation}${item.note ? '\n[' + absIndex + '] 注释: ' + item.note : ''}`;
+            }).join('\n')}\n\n`
+            : '';
+        const pairsText = chunkPairs.map((p, idx) => {
+            const absIndex = absStart + idx;
+            return `[${absIndex}]\n原文: ${p.original}\n当前译文: ${p.translation || ''}${p.note !== undefined ? '\n现有注释: ' + p.note : ''}`;
+        }).join('\n\n');
+
+        return `你是资深文学翻译编辑。现在执行一个“章节优化计划”的小块，只处理当前小块，不要处理块外句子。
+
+【章节目标】
+${chapterGoal || '在忠实原意的前提下，统一术语与口吻，消除翻译腔。'}
+
+【改写规则】
+${rewriteRules}
+
+【必须保护的术语】
+${protectedTerms}
+
+【本块可能需要注释的位置】
+${noteTargets}
+
+【本块高风险区】
+${riskRanges}
+
+【禁止事项】
+${doNot}
+
+${chapterTitle ? `【当前章节】\n${chapterTitle}\n\n` : ''}${currentSummary}${styleHint}${contextText}【当前小块】
+${pairsText}
+
+【输出格式】
+必须逐句输出，每句一行，使用绝对索引：
+[${absStart}] 润色后的最终译文
+[${Math.min(absStart + 1, absEnd)}] 润色后的最终译文 || NOTE: 简短注释
+
+要求：
+- 只输出当前小块的句子，不要输出块外句子
+- 当前小块内每个索引都必须出现一次，顺序与输入一致
+- 每一行都必须给出完整译文
+- 需要注释时用 “|| NOTE: ...”
+- 如需删除现有注释，可输出 “|| NOTE:” 留空
+- 不要输出 JSON、解释、标题、修改说明或任何额外文字`;
+    }
+
+    _extractOptimizeChunkItemsFromJson(data, pairs, startIndex, allowPartial = false) {
+        if (!data) return null;
+
+        const rawItems = Array.isArray(data) ? data
+            : Array.isArray(data.translations) ? data.translations
+            : Array.isArray(data.items) ? data.items
+            : Array.isArray(data.sentences) ? data.sentences
+            : Array.isArray(data.results) ? data.results
+            : null;
+
+        if (!rawItems || rawItems.length === 0) return null;
+
+        const mapped = new Array(pairs.length);
+
+        for (let i = 0; i < rawItems.length; i++) {
+            const item = rawItems[i];
+            let rawIndex = i + 1;
+            let translation = '';
+            let noteValue;
+            let hasExplicitNote = false;
+
+            if (typeof item === 'string') {
+                translation = item;
+            } else if (item && typeof item === 'object') {
+                rawIndex = item.index !== undefined ? item.index : (item.id !== undefined ? item.id : (item.no !== undefined ? item.no : i + 1));
+                translation = item.translation || item.text || item.result || item.target || item.chinese || item.content || item.final || '';
+                hasExplicitNote = Object.prototype.hasOwnProperty.call(item, 'note')
+                    || Object.prototype.hasOwnProperty.call(item, 'annotation')
+                    || Object.prototype.hasOwnProperty.call(item, 'comment');
+                noteValue = item.note !== undefined ? item.note : (item.annotation !== undefined ? item.annotation : item.comment);
+            }
+
+            let index = parseInt(rawIndex, 10);
+            if (isNaN(index)) index = i + 1;
+            let relIndex = index - (startIndex + 1);
+            if (relIndex < 0 || relIndex >= pairs.length) {
+                relIndex = index - 1;
+            }
+            if (relIndex < 0 || relIndex >= pairs.length) continue;
+
+            translation = this._cleanTranslationText(translation);
+            if (!translation) continue;
+
+            const prev = pairs[relIndex] || {};
+            const entry = {
+                original: prev.original,
+                translation
+            };
+
+            if (hasExplicitNote) {
+                const trimmedNote = typeof noteValue === 'string'
+                    ? noteValue.trim().replace(/^["']{2}$/, '')
+                    : '';
+                if (trimmedNote) entry.note = trimmedNote;
+                else entry.note = '';
+            } else if (prev.note && String(prev.note).trim()) {
+                entry.note = String(prev.note).trim();
+            }
+
+            mapped[relIndex] = entry;
+        }
+
+        const validCount = mapped.filter(Boolean).length;
+        if (validCount === 0) return null;
+        return (allowPartial || validCount === pairs.length) ? mapped : null;
+    }
+
+    _parseOptimizeChunkLineOutput(text, pairs, startIndex, allowPartial = false) {
+        const normalizedText = String(text || '').replace(/\r\n/g, '\n').trim();
+        if (!normalizedText) return null;
+
+        const mapped = new Array(pairs.length);
+        const lines = normalizedText.split('\n');
+        const groups = [];
+        let current = null;
+
+        for (let i = 0; i < lines.length; i++) {
+            const rawLine = lines[i];
+            const line = rawLine.trim();
+            if (!line) continue;
+
+            const match = line.match(/^(?:\[(\d+)\]|(\d+)[\.\):：、-])\s*(.*)$/);
+            if (match) {
+                if (current) groups.push(current);
+                current = {
+                    index: parseInt(match[1] || match[2], 10),
+                    parts: [match[3] || '']
+                };
+            } else if (current) {
+                current.parts.push(line);
+            }
+        }
+        if (current) groups.push(current);
+
+        for (let i = 0; i < groups.length; i++) {
+            const group = groups[i];
+            let relIndex = group.index - (startIndex + 1);
+            if (relIndex < 0 || relIndex >= pairs.length) {
+                relIndex = group.index - 1;
+            }
+            if (relIndex < 0 || relIndex >= pairs.length) continue;
+
+            const rawContent = group.parts.join('\n').trim();
+            const hasExplicitNote = /\|\|\s*(?:NOTE|ANNOTATION|注释?|注)\s*[:：]/i.test(rawContent);
+            const noteMatch = rawContent.match(/^(.*?)(?:\s*\|\|\s*(?:NOTE|ANNOTATION|注释?|注)\s*[:：]\s*(.*))?$/is);
+            let translation = noteMatch ? noteMatch[1] : rawContent;
+            let noteValue = noteMatch ? noteMatch[2] : '';
+
+            translation = this._cleanTranslationText(translation);
+            if (!translation) continue;
+
+            const prev = pairs[relIndex] || {};
+            const entry = {
+                original: prev.original,
+                translation
+            };
+
+            if (hasExplicitNote) {
+                const trimmedNote = String(noteValue || '').trim().replace(/^["']{2}$/, '');
+                if (trimmedNote) entry.note = trimmedNote;
+                else entry.note = '';
+            } else if (prev.note && String(prev.note).trim()) {
+                entry.note = String(prev.note).trim();
+            }
+
+            mapped[relIndex] = entry;
+        }
+
+        const validCount = mapped.filter(Boolean).length;
+        if (validCount === 0) {
+            if (pairs.length === 1) {
+                const only = this._cleanTranslationText(normalizedText.replace(/^(?:\[(?:1|\d+)\]|(?:1|\d+)[\.\):：、-])\s*/, ''));
+                if (only) {
+                    const fallback = this._makeOptimizeSentenceEntry(pairs[0]);
+                    fallback.translation = only;
+                    return [fallback];
+                }
+            }
+            return null;
+        }
+
+        return (allowPartial || validCount === pairs.length) ? mapped : null;
+    }
+
+    _parseOptimizeChunkResponse(content, pairs, startIndex, allowPartial = false) {
+        const parsedJson = Utils.parseJSON(String(content || ''));
+        const jsonItems = this._extractOptimizeChunkItemsFromJson(parsedJson, pairs, startIndex, true);
+        const textItems = this._parseOptimizeChunkLineOutput(content, pairs, startIndex, true);
+        const jsonCount = this._countValidBatchItems(jsonItems);
+        const textCount = this._countValidBatchItems(textItems);
+
+        if (jsonCount === pairs.length && Array.isArray(jsonItems)) return jsonItems;
+        if (textCount === pairs.length && Array.isArray(textItems)) return textItems;
+
+        const best = jsonCount >= textCount ? jsonItems : textItems;
+        const bestCount = Math.max(jsonCount, textCount);
+        if (bestCount === 0) return null;
+        return allowPartial ? best : (bestCount === pairs.length ? best : null);
+    }
+
+    _getMissingOptimizeRanges(items, startIndex) {
+        if (!Array.isArray(items) || items.length === 0) return [];
+        const ranges = [];
+        let missingStart = null;
+
+        for (let i = 0; i < items.length; i++) {
+            if (!items[i] && missingStart === null) {
+                missingStart = i;
+            } else if (items[i] && missingStart !== null) {
+                ranges.push({ start: startIndex + missingStart, end: startIndex + i - 1 });
+                missingStart = null;
+            }
+        }
+
+        if (missingStart !== null) {
+            ranges.push({ start: startIndex + missingStart, end: startIndex + items.length - 1 });
+        }
+
+        return ranges;
+    }
+
+    _getOptimizeFinalizedRange(workingSentences, startIndex, endIndex) {
+        return workingSentences
+            .slice(startIndex, endIndex + 1)
+            .map(item => this._makeOptimizeSentenceEntry(item));
+    }
+
+    async _requestOptimizeChunk(chunkPairs, startIndex, plan, chapterTitle, summaries, workingSentences) {
+        while (true) {
+            await this._checkPauseCancel();
+
+            const bridgeStartIndex = Math.max(0, startIndex - 2);
+            const bridgeContext = workingSentences
+                .slice(bridgeStartIndex, startIndex)
+                .map(item => this._makeOptimizeSentenceEntry(item));
+            const prompt = this._buildOptimizeChunkPrompt(
+                chunkPairs,
+                startIndex,
+                plan,
+                chapterTitle,
+                summaries,
+                bridgeContext,
+                bridgeStartIndex
+            );
+
+            try {
+                const res = await this._chatWithTrace([{ role: 'user', content: prompt }], {
+                    type: 'optimize',
+                    batch: chunkPairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    temperature: 0.45,
+                    reasoningEffort: this._getReasoningEffort('optimize'),
+                    useStream: true
+                });
+
+                this._lastInputTokens = res.usage?.prompt_tokens || 0;
+                this._lastOutputTokens = res.usage?.completion_tokens || 0;
+                this.tokensInput += this._lastInputTokens;
+                this.tokensOutput += this._lastOutputTokens;
+
+                return {
+                    parsed: this._parseOptimizeChunkResponse(res.content, chunkPairs, startIndex, true),
+                    finishReason: String(res.finishReason || '').trim(),
+                    requestId: res.requestId || null
+                };
+            } catch (e) {
+                if (this._cancelled) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'cancelled',
+                        batch: chunkPairs.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已取消'
+                    });
+                    throw new Error('CANCELLED');
+                }
+                if (this._paused || this._isRequestAbortedError(e)) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'paused',
+                        batch: chunkPairs.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已暂停'
+                    });
+                    await this._checkPauseCancel();
+                    continue;
+                }
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: 'error',
+                    batch: chunkPairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    message: e.message || '未知错误'
+                });
+                console.warn('小块优化失败，尝试自动缩块:', e);
+                return {
+                    parsed: null,
+                    finishReason: '',
+                    requestId: null,
+                    error: e
+                };
+            }
+        }
+    }
+
+    async _optimizeChunkRecursive(workingSentences, sourcePairs, startIndex, endIndex, plan, chapterTitle, summaries) {
+        await this._checkPauseCancel();
+
+        if (startIndex > endIndex) return [];
+
+        const chunkPairs = [];
+        for (let i = startIndex; i <= endIndex; i++) {
+            const base = sourcePairs[i] || {};
+            const current = workingSentences[i] || base;
+            chunkPairs.push({
+                original: base.original,
+                translation: current.translation || base.translation || '',
+                note: current.note
+            });
+        }
+
+        const res = await this._requestOptimizeChunk(chunkPairs, startIndex, plan, chapterTitle, summaries, workingSentences);
+        const parsed = res.parsed;
+        const validCount = this._countValidBatchItems(parsed);
+        const isLengthTruncated = ['length', 'max_tokens'].includes(String(res.finishReason || '').trim().toLowerCase());
+
+        if (Array.isArray(parsed) && validCount > 0) {
+            for (let i = 0; i < parsed.length; i++) {
+                if (!parsed[i]) continue;
+                workingSentences[startIndex + i] = this._makeOptimizeSentenceEntry(parsed[i]);
+            }
+        }
+
+        if (validCount === chunkPairs.length) {
+            return this._getOptimizeFinalizedRange(workingSentences, startIndex, endIndex);
+        }
+
+        if (isLengthTruncated && chunkPairs.length > 1) {
+            const missingRanges = validCount > 0
+                ? this._getMissingOptimizeRanges(parsed, startIndex)
+                : [{ start: startIndex, end: endIndex }];
+
+            for (let i = 0; i < missingRanges.length; i++) {
+                const range = missingRanges[i];
+                await this._optimizeChunkRecursive(
+                    workingSentences,
+                    sourcePairs,
+                    range.start,
+                    range.end,
+                    plan,
+                    chapterTitle,
+                    summaries
+                );
+            }
+            return this._getOptimizeFinalizedRange(workingSentences, startIndex, endIndex);
+        }
+
+        if (validCount > 0) {
+            return this._getOptimizeFinalizedRange(workingSentences, startIndex, endIndex);
+        }
+
+        if (res.error && chunkPairs.length > 1) {
+            const mid = Math.floor((startIndex + endIndex) / 2);
+            if (mid >= startIndex && mid < endIndex) {
+                await this._optimizeChunkRecursive(workingSentences, sourcePairs, startIndex, mid, plan, chapterTitle, summaries);
+                await this._optimizeChunkRecursive(workingSentences, sourcePairs, mid + 1, endIndex, plan, chapterTitle, summaries);
+            }
+        }
+
+        return this._getOptimizeFinalizedRange(workingSentences, startIndex, endIndex);
     }
 
     _collectOptimizeSummaries(chapter, chapterIndex) {

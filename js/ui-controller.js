@@ -1015,12 +1015,12 @@ this._showPage('work');
 
     _ensureOptimizeSelectModal() {
         let modal = document.getElementById('modal-optimize-select');
-        if (modal) return modal;
 
-        modal = document.createElement('div');
-        modal.id = 'modal-optimize-select';
-        modal.className = 'modal-bg hidden';
-        modal.innerHTML = `
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'modal-optimize-select';
+            modal.className = 'modal-bg hidden';
+            modal.innerHTML = `
             <div class="modal-card">
                 <div class="modal-head">
                     <h3>✨ 选择要优化的章节</h3>
@@ -1041,7 +1041,12 @@ this._showPage('work');
                 </div>
             </div>
         `;
-        document.body.appendChild(modal);
+        }
+
+        const readerPage = document.getElementById('page-reader');
+        const host = readerPage && !readerPage.classList.contains('hidden') ? readerPage : document.body;
+        if (modal.parentElement !== host) host.appendChild(modal);
+        modal.style.zIndex = '360';
         return modal;
     }
 
