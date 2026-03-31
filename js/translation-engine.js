@@ -289,14 +289,11 @@ class TranslationEngine {
             for (let attempt = 0; attempt < 3; attempt++) {
                 await this._checkPauseCancel();
                 try {
-                    // 动态maxTokens：按原文长度估算，最少100最多350
-                    const estTokens = Math.min(350, Math.max(100, Math.ceil(sentence.length * 0.8)));
                     const res = await this._chatWithTrace(messages, {
                         type: 'translate',
                         batch: 1,
                         chapterIndex: context.chapterIndex,
                         temperature: this.config.temperature,
-                        maxTokens: estTokens,
                         reasoningEffort: this._getReasoningEffort('translate'),
                         useStream: true
                     });
@@ -393,6 +390,9 @@ class TranslationEngine {
                     lastError = e;
                     const isParseError = !!e._batchParseFailure;
                     const details = e && e._batchDetails ? e._batchDetails : null;
+                    const isLengthTruncated = isParseError
+                        && details
+                        && ['length', 'max_tokens'].includes(String(details.finishReason || '').trim().toLowerCase());
                     this._emit('error', {
                         taskType: 'translate',
                         type: isParseError ? 'format' : 'api',
@@ -414,6 +414,9 @@ class TranslationEngine {
                         contentPreview: details ? details.responsePreview : '',
                         maxTokens: details ? details.maxTokens : maxTokens
                     });
+                    if (isLengthTruncated) {
+                        return this._translateBatchParseFailureFallback(sentences, context);
+                    }
                     if (attempt < 2) {
                         const delay = isParseError ? 1000 : 3000 * (attempt + 1);
                         this._emit('phase', {
@@ -649,7 +652,7 @@ return [
             chapterIndex,
             chapterTitle = '',
             temperature = this.config.temperature,
-            maxTokens = 800,
+            maxTokens,
             reasoningEffort,
             useStream = true
         } = meta;
@@ -668,7 +671,10 @@ return [
             reasoningMode: requestedReasoningMode
         });
 
-        const options = { temperature, maxTokens };
+        const options = { temperature };
+        if (maxTokens !== undefined && maxTokens !== null) {
+            options.maxTokens = maxTokens;
+        }
         if (reasoningEffort) {
             options.reasoningEffort = reasoningEffort;
             options.reasoning = { effort: reasoningEffort };
