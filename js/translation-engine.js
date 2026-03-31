@@ -609,13 +609,8 @@ return [
 }
 
     _estimateBatchMaxTokens(sentences) {
-        // 每句翻译约需40-60 tokens（含JSON结构开销）
-        // 45句 * 50 = 2250，再加JSON框架约200 tokens
-        const perSentenceTokens = 55;
-        const jsonOverhead = 200;
-        const estimated = sentences.length * perSentenceTokens + jsonOverhead;
-        // 下限400（小批量），上限6000（大批量不截断）
-        return Math.min(6000, Math.max(400, estimated));
+        // 不设上限，让模型自由输出完整结果
+        return undefined;
     }
 
     _normalizeReasoningEffort(value, fallback = 'medium') {

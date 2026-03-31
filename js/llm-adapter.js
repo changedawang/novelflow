@@ -142,7 +142,7 @@ class LLMAdapter {
         if (!this.model) throw new Error('未配置模型，请先填写模型名或点击“获取模型”选择模型');
 
         const temperature = options.temperature ?? 0.3;
-        const maxTokens = options.maxTokens ?? options.max_tokens ?? 800;
+        const maxTokens = options.maxTokens ?? options.max_tokens;
         const reasoningMode = options._reasoningMode
             || (options.reasoningEffort ? 'effort' : ((options.reasoning && typeof options.reasoning === 'object') ? 'object' : 'none'));
         const requestedReasoningMode = options._requestedReasoningMode || reasoningMode;
@@ -150,9 +150,11 @@ class LLMAdapter {
             model: this.model,
             messages,
             temperature,
-            max_tokens: maxTokens,
             stream: !!stream,
         };
+        if (maxTokens !== undefined && maxTokens !== null) {
+            payload.max_tokens = maxTokens;
+        }
 
         if (reasoningMode === 'effort' && options.reasoningEffort) payload.reasoning_effort = options.reasoningEffort;
         if (reasoningMode === 'object' && options.reasoning && typeof options.reasoning === 'object') payload.reasoning = options.reasoning;
