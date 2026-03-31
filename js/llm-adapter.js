@@ -192,15 +192,19 @@ class LLMAdapter {
 
     /** 带密钥轮询的chat */
     async chat(messages, options = {}) {
-        const maxRotations = Math.max(this.apiKeys.length, 1); // 至少尝试1次
+        const keyCount = Math.max(this.apiKeys.length, 1);
         let lastError;
-        let triedKeys = new Set();
+        let failedKeys = new Set(); // 记录本次请求中失败的key索引
         
-        for (let rot = 0; rot < maxRotations * 2; rot++) { // 允许多轮尝试
-            if (triedKeys.has(this._keyIndex) && triedKeys.size >= this.apiKeys.length) {
-                break; // 所有key都试过了
+        // 最多尝试所有key各一次
+        for (let attempt = 0; attempt < keyCount; attempt++) {
+            const currentIdx = this._keyIndex;
+            
+            // 如果当前key已经在本次请求中失败过，跳过
+            if (failedKeys.has(currentIdx)) {
+                if (!this._rotateKey('skip_failed')) break;
+                continue;
             }
-            triedKeys.add(this._keyIndex);
             
             try {
                 const res = await this._doChat(messages, options);
@@ -209,21 +213,22 @@ class LLMAdapter {
             } catch (e) {
                 lastError = e;
                 this._markError();
+                failedKeys.add(currentIdx);
                 
                 const errMsg = String(e.message || '').toLowerCase();
+                const isAborted = errMsg.includes('abort') || errMsg.includes('取消');
+                if (isAborted) throw e;
+                
                 const is429 = errMsg.includes('429') || errMsg.includes('rate') || errMsg.includes('limit');
                 const is401 = errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('unauthorized');
                 const isTimeout = errMsg.includes('timeout') || errMsg.includes('超时');
-                const isAborted = errMsg.includes('abort') || errMsg.includes('取消');
                 
-                if (isAborted) throw e;
-                
-                if ((is429 || is401 || isTimeout) && this._rotateKey(is429 ? 'rate_limit' : is401 ? 'auth_error' : 'timeout')) {
+                // 尝试切换到下一个key
+                const reason = is429 ? 'rate_limit' : is401 ? 'auth_error' : isTimeout ? 'timeout' : 'error';
+                if (failedKeys.size < keyCount && this._rotateKey(reason)) {
                     continue;
                 }
-                
-                if (this._rotateKey('error')) continue;
-                break;
+                break; // 无法切换或所有key都失败了
             }
         }
         throw lastError;
