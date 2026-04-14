@@ -327,28 +327,58 @@ class LLMAdapter {
             }
         }
     }
-    /** 获取可用模型列表 (OpenAI兼容接口 /models) */
+    /** 获取可用模型列表 (OpenAI兼容接口，自动尝试多种端点) */
     async fetchModels(baseUrl, apiKey) {
-        const url = (baseUrl || this.baseUrl).replace(/\/+$/, '') + '/models';
+        const raw = (baseUrl || this.baseUrl).replace(/\/+$/, '');
         const key = apiKey || this.currentKey;
-        const response = await this._fetchWithTimeout(url, {
-            method: 'GET',
-            headers: { 'Authorization': 'Bearer ' + key },
-        });
-        if (!response.ok) {
-            const err = await response.text();
-            throw new Error(`获取模型失败 (${response.status}): ${err}`);
+        const headers = { 'Authorization': 'Bearer ' + key };
+
+        // 构建候选 URL 列表（去重）
+        const candidates = [];
+        candidates.push(raw + '/models');
+        // 如果 baseUrl 以 /v1 结尾，额外试去掉 /v1 后的 /models
+        if (/\/v1$/i.test(raw)) {
+            candidates.push(raw.replace(/\/v1$/i, '') + '/models');
         }
-        const data = await response.json();
-        // OpenAI格式: { data: [{id:'gpt-4',...}, ...] }
-        if (data.data && Array.isArray(data.data)) {
-            return data.data.map(m => m.id).sort();
+        // 也试 /v1/models（万一用户填的是不带 /v1 的根路径）
+        if (!/\/v1$/i.test(raw)) {
+            candidates.push(raw + '/v1/models');
         }
-        // 部分API直接返回数组
-        if (Array.isArray(data)) {
-            return data.map(m => typeof m === 'string' ? m : m.id).sort();
+        const seen = new Set();
+        const urls = candidates.filter(u => { if (seen.has(u)) return false; seen.add(u); return true; });
+
+        let lastError = '';
+        for (const url of urls) {
+            try {
+                const response = await this._fetchWithTimeout(url, { method: 'GET', headers });
+                if (!response.ok) {
+                    const err = await response.text();
+                    lastError = `(${response.status}) ${err.slice(0, 200)}`;
+                    continue;
+                }
+                const data = await response.json();
+                // OpenAI格式: { data: [{id:'gpt-4',...}, ...] }
+                if (data.data && Array.isArray(data.data) && data.data.length > 0) {
+                    return data.data.map(m => m.id).sort();
+                }
+                // 部分API直接返回数组
+                if (Array.isArray(data) && data.length > 0) {
+                    return data.map(m => typeof m === 'string' ? m : m.id).sort();
+                }
+                // 有些返回 { models: [...] }
+                if (data.models && Array.isArray(data.models) && data.models.length > 0) {
+                    return data.models.map(m => typeof m === 'string' ? m : (m.id || m.name || '')).filter(Boolean).sort();
+                }
+                lastError = '返回数据格式无法识别或模型列表为空';
+            } catch (e) {
+                if (e && e.name === 'AbortError') {
+                    lastError = '请求超时';
+                } else {
+                    lastError = e.message || '网络错误';
+                }
+            }
         }
-        throw new Error('无法解析模型列表');
+        throw new Error(`获取模型失败: ${lastError}。该 API 可能不支持模型列表接口，请手动输入模型名称。`);
     }
     countTokens(text) { return Utils.estimateTokens(text); }
 }
