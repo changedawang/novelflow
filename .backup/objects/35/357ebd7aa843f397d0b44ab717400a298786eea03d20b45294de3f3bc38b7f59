@@ -327,78 +327,28 @@ class LLMAdapter {
             }
         }
     }
-    /** 解析模型列表响应，兼容多种格式 */
-    _parseModelsResponse(data) {
+    /** 获取可用模型列表 (OpenAI兼容接口 /models) */
+    async fetchModels(baseUrl, apiKey) {
+        const url = (baseUrl || this.baseUrl).replace(/\/+$/, '') + '/models';
+        const key = apiKey || this.currentKey;
+        const response = await this._fetchWithTimeout(url, {
+            method: 'GET',
+            headers: { 'Authorization': 'Bearer ' + key },
+        });
+        if (!response.ok) {
+            const err = await response.text();
+            throw new Error(`获取模型失败 (${response.status}): ${err}`);
+        }
+        const data = await response.json();
         // OpenAI格式: { data: [{id:'gpt-4',...}, ...] }
-        if (data.data && Array.isArray(data.data) && data.data.length > 0) {
-            return data.data.map(m => m.id).filter(Boolean).sort();
+        if (data.data && Array.isArray(data.data)) {
+            return data.data.map(m => m.id).sort();
         }
         // 部分API直接返回数组
-        if (Array.isArray(data) && data.length > 0) {
-            return data.map(m => typeof m === 'string' ? m : m.id).filter(Boolean).sort();
+        if (Array.isArray(data)) {
+            return data.map(m => typeof m === 'string' ? m : m.id).sort();
         }
-        // 有些返回 { models: [...] }
-        if (data.models && Array.isArray(data.models) && data.models.length > 0) {
-            return data.models.map(m => typeof m === 'string' ? m : (m.id || m.name || '')).filter(Boolean).sort();
-        }
-        return null;
-    }
-    /** 获取可用模型列表 (OpenAI兼容接口，自动尝试多种端点+CORS兼容) */
-    async fetchModels(baseUrl, apiKey) {
-        const raw = (baseUrl || this.baseUrl).replace(/\/+$/, '');
-        const key = apiKey || this.currentKey;
-
-        // 构建候选 URL 列表（去重）
-        const candidates = [];
-        candidates.push(raw + '/models');
-        if (/\/v1$/i.test(raw)) {
-            candidates.push(raw.replace(/\/v1$/i, '') + '/models');
-        }
-        if (!/\/v1$/i.test(raw)) {
-            candidates.push(raw + '/v1/models');
-        }
-        const seen = new Set();
-        const urls = candidates.filter(u => { if (seen.has(u)) return false; seen.add(u); return true; });
-
-        let lastError = '';
-
-        // 策略: 对每个URL先尝试不带Auth头的简单请求(避免CORS预检)，
-        // 失败再尝试带Auth头的请求
-        for (const url of urls) {
-            // --- 尝试1: 不带 Authorization (简单请求，不触发CORS预检) ---
-            try {
-                const r1 = await this._fetchWithTimeout(url, { method: 'GET' });
-                if (r1.ok) {
-                    const data = await r1.json();
-                    const models = this._parseModelsResponse(data);
-                    if (models && models.length > 0) return models;
-                }
-            } catch (e) { /* 静默，继续下一策略 */ }
-
-            // --- 尝试2: 带 Authorization 头 ---
-            try {
-                const r2 = await this._fetchWithTimeout(url, {
-                    method: 'GET',
-                    headers: { 'Authorization': 'Bearer ' + key }
-                });
-                if (!r2.ok) {
-                    const err = await r2.text();
-                    lastError = `(${r2.status}) ${err.slice(0, 200)}`;
-                    continue;
-                }
-                const data = await r2.json();
-                const models = this._parseModelsResponse(data);
-                if (models && models.length > 0) return models;
-                lastError = '返回数据格式无法识别或模型列表为空';
-            } catch (e) {
-                if (e && e.name === 'AbortError') {
-                    lastError = '请求超时';
-                } else {
-                    lastError = e.message || '网络错误';
-                }
-            }
-        }
-        throw new Error(`获取模型失败: ${lastError}。该 API 可能不支持模型列表接口，请手动输入模型名称。`);
+        throw new Error('无法解析模型列表');
     }
     countTokens(text) { return Utils.estimateTokens(text); }
 }

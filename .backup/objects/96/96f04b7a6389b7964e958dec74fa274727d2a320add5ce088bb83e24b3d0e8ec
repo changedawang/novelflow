@@ -1,0 +1,1391 @@
+/* ============================================
+   NovelFlow — 核心翻译引擎
+   三层记忆系统 + 术语表 + 文风锚定
+   ============================================ */
+
+class TranslationEngine {
+    constructor(config) {
+        this.llm = new LLMAdapter({
+            ...config.api,
+            onKeySwitch: (info) => this._emit('keySwitch', info),
+        });
+        this.config = {
+            targetLang: config.targetLang || '简体中文',
+            novelType: config.novelType || '通用',
+            windowSize: config.windowSize || 5,        // 降低默认窗口
+            windowSizeShort: config.windowSizeShort || 3, // 短句用更小窗口
+            summaryInterval: config.summaryInterval || 30, // 增大间隔省token
+            temperature: config.temperature || 0.3,
+            autoGlossary: config.autoGlossary !== false,
+            autoStyle: config.autoStyle !== false,
+            maxGlossaryPerSentence: config.maxGlossaryPerSentence || 8, // 每句最多术语
+            translationBatchSize: Math.max(1, parseInt(config.translationBatchSize, 10) || 30),
+            chapterSummaryLen: config.chapterSummaryLen || 60,  // 章节摘要长度
+            globalSummaryLen: config.globalSummaryLen || 120,   // 全局摘要长度
+        };
+
+        // 核心状态
+        this.glossary = new GlossaryManager();
+        this.styleProfile = null;
+        this.globalSummary = '';
+        this.chapterSummaries = {};
+        this.slidingWindow = []; // [{original, translation}]
+
+        // 统计
+        this.tokensInput = 0;
+        this.tokensOutput = 0;
+        this.completedSentences = 0;
+        this.totalSentences = 0;
+
+        // 控制
+        this._paused = false;
+        this._pausedAt = null;
+        this._cancelled = false;
+        this._onProgress = null; // callback(event, data)
+        this._listeners = Object.create(null);
+
+    }
+
+    /**
+     * 翻译全书 — 主入口
+     */
+    async translateBook(chapters, onProgress) {
+        this._onProgress = onProgress;
+        this._cancelled = false;
+        this._paused = false;
+        this.totalSentences = chapters.reduce((sum, ch) => sum + ch.sentences.length, 0);
+        this.completedSentences = 0;
+
+        // === Phase 0: 预处理 ===
+        this._emit('phase', { phase: 'preprocessing', message: '预处理中...' });
+
+        // 收集全文前部分用于分析
+        const allText = chapters.map(ch => ch.sentences.join(' ')).join('\n\n');
+        const sampleText = allText.slice(0, 2500);
+
+        // 文风分析
+        if (this.config.autoStyle) {
+            this._emit('phase', { phase: 'style', message: '分析文风...' });
+            await this._analyzeStyle(sampleText);
+        }
+
+        // 术语提取
+        if (this.config.autoGlossary) {
+            this._emit('phase', { phase: 'glossary', message: '提取术语...' });
+            await this._extractGlossary(allText);
+        }
+
+        // === Phase 1: 逐章翻译 ===
+        this._emit('phase', { phase: 'translating', message: '开始翻译...' });
+
+        const results = [];
+
+        for (let chIdx = 0; chIdx < chapters.length; chIdx++) {
+            await this._checkPauseCancel();
+            const chapter = chapters[chIdx];
+
+            this._emit('chapterStart', {
+                chapterIndex: chIdx,
+                title: chapter.title,
+                sentenceCount: chapter.sentences.length,
+            });
+
+            // 保留跨章上下文（最后3句）
+            if (this.slidingWindow.length > 3) {
+                this.slidingWindow = this.slidingWindow.slice(-3);
+            }
+
+            const translatedSentences = [];
+            const summaryBatchSize = this.config.summaryInterval;
+            const translationBatchSize = this.config.translationBatchSize;
+
+            for (let i = 0; i < chapter.sentences.length; i += translationBatchSize) {
+                await this._checkPauseCancel();
+
+                const sourceBatch = chapter.sentences.slice(i, i + translationBatchSize);
+
+                // 构建上下文（优化：只用当前批次+最近2句做术语匹配，省CPU和内存）
+                const recentCtx = this.slidingWindow.slice(-2).map(w => w.original).join(' ');
+                const relevantTerms = this.glossary.getRelevant(sourceBatch.join(' ') + ' ' + recentCtx);
+
+                const context = {
+                    chapterIndex: chIdx,
+                    sentenceIndex: i,
+                    slidingWindow: [...this.slidingWindow],
+                    chapterSummary: this.chapterSummaries[chIdx] || '',
+                    globalSummary: this.globalSummary,
+                    relevantGlossary: relevantTerms,
+                };
+
+                const batchResult = await this._translateBatch(sourceBatch, context);
+
+                if (batchResult.newTerms && batchResult.newTerms.length > 0) {
+                    this.glossary.addBatch(batchResult.newTerms);
+                    this._emit('glossaryUpdate', { glossary: this.glossary });
+                }
+
+                for (let bi = 0; bi < batchResult.items.length; bi++) {
+                    const sentenceIndex = i + bi;
+                    const sentence = sourceBatch[bi];
+                    const result = batchResult.items[bi];
+
+                    translatedSentences.push(result);
+
+                    this.slidingWindow.push({ original: sentence, translation: result.translation });
+                    if (this.slidingWindow.length > this.config.windowSize) {
+                        this.slidingWindow.shift();
+                    }
+
+                    this.completedSentences++;
+                    this._emit('sentenceComplete', {
+                        chapterIndex: chIdx,
+                        sentenceIndex: sentenceIndex,
+                        original: sentence,
+                        translation: result.translation,
+                        completed: this.completedSentences,
+                        total: this.totalSentences,
+                        percent: Math.round(this.completedSentences / this.totalSentences * 100),
+                        tokensIn: this.tokensInput,
+                        tokensOut: this.tokensOutput,
+                    });
+
+                    // 每batch句生成摘要
+                    if ((sentenceIndex + 1) % summaryBatchSize === 0 || sentenceIndex === chapter.sentences.length - 1) {
+                        const batchStart = Math.max(0, sentenceIndex - summaryBatchSize + 1);
+                        const batchTranslations = translatedSentences.slice(batchStart).map(s => s.translation).join(' ');
+                        await this._updateChapterSummary(chIdx, batchTranslations);
+                    }
+                }
+            }
+
+            // 章节完成 → 更新全局摘要
+            await this._updateGlobalSummary();
+
+            results.push({
+                chapterIndex: chIdx,
+                title: chapter.title,
+                sentences: translatedSentences,
+                summary: this.chapterSummaries[chIdx] || '',
+            });
+
+            this._emit('chapterComplete', {
+                chapterIndex: chIdx,
+                title: chapter.title,
+            });
+        }
+
+        // === Phase 2: 完成 ===
+        this._emit('complete', {
+            chapters: results.length,
+            sentences: this.completedSentences,
+            tokensIn: this.tokensInput,
+            tokensOut: this.tokensOutput,
+            glossaryTerms: this.glossary.entries.length,
+        });
+
+        return results;
+    }
+
+    // ── 文风分析（优化版）──
+
+    async _analyzeStyle(sampleText) {
+        await this._checkPauseCancel();
+        const sample = sampleText.slice(0, 1200);
+        const prompt = `分析文风,输出JSON:{"style_summary":"30字风格","translation_guidelines":["要点1","要点2"]}\n文本:${sample}`;
+
+        try {
+            const res = await this.llm.chat(
+                [{ role: 'system', content: 'JSON输出' }, { role: 'user', content: prompt }],
+                { temperature: 0.3, maxTokens: 200 }
+            );
+            this.tokensInput += res.usage.prompt_tokens || 0;
+            this.tokensOutput += res.usage.completion_tokens || 0;
+
+            const data = Utils.parseJSON(res.content);
+            if (data) {
+                this.styleProfile = data;
+                this._emit('styleAnalyzed', { style: data });
+            }
+        } catch (e) {
+            if (this._cancelled) throw new Error('CANCELLED');
+            if (this._paused || this._isRequestAbortedError(e)) {
+                await this._checkPauseCancel();
+                return this._analyzeStyle(sampleText);
+            }
+            console.warn('文风分析失败:', e);
+            this.styleProfile = { style_summary: '忠实流畅', translation_guidelines: ['忠实', '流畅'] };
+            this._emit('styleAnalyzed', { style: this.styleProfile });
+        }
+    }
+
+    // ── 术语提取（优化版）──
+
+    async _extractGlossary(fullText) {
+        const chunkSize = 2000;
+        const maxChunks = 3;
+        const chunks = [];
+        for (let i = 0; i < fullText.length && chunks.length < maxChunks; i += chunkSize) {
+            chunks.push(fullText.slice(i, i + chunkSize));
+        }
+
+        for (let i = 0; i < chunks.length; i++) {
+            // 暂停检查：必须在循环开头
+            await this._checkPauseCancel();
+            
+            // 暂停后继续时跳过已完成的
+            if (this._paused) {
+                this._emit('phase', { phase: 'paused', message: '已暂停 - 术语提取' });
+                await this._checkPauseCancel(); // 等待恢复
+            }
+            
+            this._emit('phase', { phase: 'glossary', message: `术语 (${i + 1}/${chunks.length})` });
+
+            const prompt = `提取专名(人/地/物),输出JSON:{"terms":[{"original":"","translation":"","category":"character|location|item|other"}]}\n${chunks[i]}`;
+
+            try {
+                const res = await this.llm.chat(
+                    [{ role: 'system', content: 'NER,JSON' }, { role: 'user', content: prompt }],
+                    { temperature: 0.1, maxTokens: 500 }
+                );
+                this.tokensInput += res.usage.prompt_tokens || 0;
+                this.tokensOutput += res.usage.completion_tokens || 0;
+
+                const data = Utils.parseJSON(res.content);
+                if (data && data.terms) this.glossary.addBatch(data.terms);
+            } catch (e) {
+                if (this._cancelled) throw new Error('CANCELLED');
+                // 暂停导致的abort错误，等待恢复后重试当前块
+                if (this._paused || this._isRequestAbortedError(e)) {
+                    this._emit('phase', { phase: 'paused', message: '已暂停' });
+                    await this._checkPauseCancel();
+                    i -= 1; // 重试当前块
+                    continue;
+                }
+                console.warn(`术语提取块${i}失败:`, e);
+                if (e && /超时/.test(String(e.message || ''))) {
+                    this._emit('phase', { phase: 'glossary', message: '术语提取超时，跳过剩余术语...' });
+                    break;
+                }
+            }
+        }
+        this._emit('glossaryUpdate', { glossary: this.glossary });
+    }
+
+    // ── 翻译单句 ──
+
+    async _translateSentence(sentence, context) {
+        const messages = this._buildPrompt(sentence, context);
+        // 无限重试直到成功（API不可用时自动暂停，可用时自动恢复）
+        while (true) {
+            await this._checkPauseCancel();
+            // 尝试3轮（每轮会轮询所有key）
+            let lastError;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                await this._checkPauseCancel();
+                try {
+                    // 动态maxTokens：按原文长度估算，最少100最多350
+                    const estTokens = Math.min(350, Math.max(100, Math.ceil(sentence.length * 0.8)));
+                    const res = await this.llm.chat(messages, {
+                        temperature: this.config.temperature,
+                        maxTokens: estTokens,
+                    });
+                    this.tokensInput += res.usage.prompt_tokens || 0;
+                    this.tokensOutput += res.usage.completion_tokens || 0;
+                    this._consecutiveErrors = 0;
+                    return this._parseTranslationResponse(res.content, sentence);
+                } catch (e) {
+                    if (this._cancelled) throw new Error('CANCELLED');
+                    if (this._paused) {
+                        attempt -= 1;
+                        await this._checkPauseCancel();
+                        continue;
+                    }
+                    lastError = e;
+                    this._emit('error', {
+                        type: 'api', message: e.message,
+                        attempt: attempt + 1, maxAttempts: 3,
+                        sentence: sentence.slice(0, 50),
+                    });
+                    if (attempt < 2) {
+                        const delay = 3000 * (attempt + 1);
+                        this._emit('phase', { phase:'retrying', message:`API错误，${delay/1000}秒后重试 (${attempt+1}/3)...` });
+                        await Utils.sleep(delay);
+                    }
+                }
+            }
+            // 3轮全失败 → 自动暂停等待
+            this._consecutiveErrors = (this._consecutiveErrors || 0) + 1;
+            this._paused = true;
+            this._emit('autoPaused', {
+                reason: 'api_error',
+                message: `API连续失败(${this._consecutiveErrors}): ${lastError.message}`,
+                hint: '所有密钥不可用，等待恢复中... 点击"继续"重试',
+                consecutiveErrors: this._consecutiveErrors,
+            });
+            // 等待用户恢复（或API恢复后用户点继续）
+            await this._checkPauseCancel();
+            this._emit('phase', { phase:'retrying', message:'恢复中，重新尝试...' });
+            // 循环回去继续尝试，永不放弃
+        }
+    }
+
+    async _translateBatch(sentences, context) {
+        if (!sentences || sentences.length === 0) {
+            return { items: [], newTerms: [] };
+        }
+
+        if (sentences.length === 1) {
+            const result = await this._translateSentence(sentences[0], context);
+            return {
+                items: [{ original: result.original, translation: result.translation }],
+                newTerms: result.newTerms || [],
+            };
+        }
+
+        const messages = this._buildBatchPrompt(sentences, context);
+        const maxTokens = this._estimateBatchMaxTokens(sentences);
+
+        while (true) {
+            await this._checkPauseCancel();
+            let lastError;
+
+            for (let attempt = 0; attempt < 3; attempt++) {
+                await this._checkPauseCancel();
+                try {
+this._emit('apiCall', { status: 'requesting', batch: sentences.length });
+const res = await this.llm.chat(messages, {
+temperature: this.config.temperature,
+maxTokens: maxTokens,
+});
+this._emit('apiCall', { status: 'received', content: res.content.slice(0, 200) + (res.content.length > 200 ? '...' : '') });
+this.tokensInput += res.usage.prompt_tokens || 0;
+this.tokensOutput += res.usage.completion_tokens || 0;
+this._consecutiveErrors = 0;
+return this._parseBatchTranslationResponse(res.content, sentences);
+                } catch (e) {
+                    if (this._cancelled) throw new Error('CANCELLED');
+                    if (this._paused || this._isRequestAbortedError(e)) {
+                        attempt -= 1;
+                        await this._checkPauseCancel();
+                        continue;
+                    }
+                    lastError = e;
+                    const isParseError = !!e._batchParseFailure;
+                    this._emit('error', {
+                        type: isParseError ? 'format' : 'api',
+                        message: e.message,
+                        attempt: attempt + 1,
+                        maxAttempts: 3,
+                        sentence: (sentences[0] || '').slice(0, 50),
+                    });
+                    if (attempt < 2) {
+                        const delay = isParseError ? 1000 : 3000 * (attempt + 1);
+                        this._emit('phase', {
+                            phase: 'retrying',
+                            message: isParseError
+                                ? `批量译文格式异常，${delay / 1000}秒后重试 (${attempt + 1}/3)...`
+                                : `API错误，${delay / 1000}秒后重试 (${attempt + 1}/3)...`
+                        });
+                        await Utils.sleep(delay);
+                    }
+                }
+            }
+
+            if (lastError && lastError._batchParseFailure) {
+                console.warn('批量翻译解析失败，回退到逐句模式:', lastError);
+                return this._translateBatchSequentialFallback(sentences, context);
+            }
+
+            this._consecutiveErrors = (this._consecutiveErrors || 0) + 1;
+            this._paused = true;
+            this._emit('autoPaused', {
+                reason: 'api_error',
+                message: `API连续失败(${this._consecutiveErrors}): ${String(lastError && lastError.message || lastError || '未知错误')}`,
+                hint: '所有密钥不可用，等待恢复中... 点击"继续"重试',
+                consecutiveErrors: this._consecutiveErrors,
+            });
+            await this._checkPauseCancel();
+            this._emit('phase', { phase:'retrying', message:'恢复中，重新尝试...' });
+        }
+    }
+
+    async _translateBatchSequentialFallback(sentences, context) {
+        const items = [];
+        let newTerms = [];
+        const localWindow = [...(context.slidingWindow || [])];
+
+        for (let i = 0; i < sentences.length; i++) {
+            const sentence = sentences[i];
+            const recentCtx = localWindow.slice(-2).map(w => w.original).join(' ');
+            const relevantTerms = this.glossary.getRelevant(sentence + ' ' + recentCtx);
+            const result = await this._translateSentence(sentence, {
+                chapterIndex: context.chapterIndex,
+                sentenceIndex: context.sentenceIndex + i,
+                slidingWindow: [...localWindow],
+                chapterSummary: context.chapterSummary,
+                globalSummary: context.globalSummary,
+                relevantGlossary: relevantTerms,
+            });
+
+            items.push({ original: sentence, translation: result.translation });
+
+            if (result.newTerms && result.newTerms.length > 0) {
+                newTerms = newTerms.concat(result.newTerms);
+            }
+
+            localWindow.push({ original: sentence, translation: result.translation });
+            if (localWindow.length > this.config.windowSize) {
+                localWindow.shift();
+            }
+        }
+
+        return {
+            items: items,
+            newTerms: this._normalizeTerms(newTerms),
+        };
+    }
+
+    // ── 构建Prompt（优化版：动态上下文 + token节省）──
+
+    _buildPromptContextParts(context, sourceLength) {
+        const parts = [];
+        const maxTerms = this.config.maxGlossaryPerSentence;
+        const relevantTerms = (context.relevantGlossary || []).slice(0, maxTerms);
+
+        if (relevantTerms.length > 0) {
+            const termLines = relevantTerms.map(t => `${t.original}→${t.translation}`).join('; ');
+            parts.push(`[术语] ${termLines}`);
+        }
+
+        if (context.globalSummary && context.sentenceIndex >= 5) {
+            parts.push(`[背景] ${context.globalSummary.slice(0, this.config.globalSummaryLen)}`);
+        }
+
+        if (context.chapterSummary) {
+            parts.push(`[本章] ${context.chapterSummary.slice(0, this.config.chapterSummaryLen)}`);
+        }
+
+        if (context.slidingWindow && context.slidingWindow.length > 0) {
+            const isShort = sourceLength < 80;
+            const winSize = isShort ? this.config.windowSizeShort : this.config.windowSize;
+            const window = context.slidingWindow.slice(-winSize);
+            const windowLines = window.map(w => `${w.original}|${w.translation}`).join('\n');
+            parts.push(`[前文]\n${windowLines}`);
+        }
+
+        return parts;
+    }
+
+    _buildPrompt(sentence, context) {
+        const style = this.styleProfile;
+        const styleSum = style?.style_summary || '忠实流畅';
+        const typeTag = { '奇幻': '史诗', '科幻': '精确', '文学': '细腻', '言情': '温柔' }[this.config.novelType] || '';
+        const systemPrompt = `文学翻译→${this.config.targetLang}。风格:${styleSum}${typeTag ? '/'+typeTag : ''}。遵循术语表,保持一致。`;
+
+        const parts = this._buildPromptContextParts(context, sentence.length);
+        parts.push(`[译] ${sentence}`);
+        parts.push('输出译文。新名词另起行:NEW_TERMS:[{"original":"","translation":"","category":""}]');
+
+        return [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: parts.join('\n') },
+        ];
+    }
+
+    _buildBatchPrompt(sentences, context) {
+const systemPrompt = `你是专业文学翻译，遵循"信达雅"原则翻译为${this.config.targetLang}：
+- 信：准确传达原意，不增不减
+- 达：通顺流畅，符合目标语言表达习惯
+- 雅：保持原文的文学性、语气、基调
+跟随原文风格变化。遵循术语表保持一致。严格输出JSON。
+
+【注释规则】遇到以下内容时，用note字段添加15字以内的简短注释：
+- 书名/名著（如Black Beauty→注释：英国经典儿童小说，讲述一匹马的一生）
+- 文学引用/典故（简述出处和含义）
+- 俚语/双关语（解释字面外的含义）
+- 需要背景知识才能理解的内容
+普通句子不加note。`;
+
+const parts = this._buildPromptContextParts(context, sentences.join(' ').length);
+parts.push('[待译]');
+parts.push(sentences.map((sentence, idx) => `${idx + 1}. ${sentence}`).join('\n'));
+parts.push('只输出JSON:{"translations":[{"index":1,"translation":"","note":"可选,15字内注释"}],"newTerms":[{"original":"","translation":"","category":"character|location|item|other"}]}');
+parts.push('要求:translations数量=原句数量,顺序一致。仅特殊内容加note,普通句子省略note字段。');
+
+return [
+{ role: 'system', content: systemPrompt },
+{ role: 'user', content: parts.join('\n') },
+];
+}
+
+    _estimateBatchMaxTokens(sentences) {
+        const totalChars = sentences.join(' ').length;
+        return Math.min(1200, Math.max(220, Math.ceil(totalChars * 0.9)));
+    }
+
+    // ── 解析翻译响应 ──
+
+    _splitResponseAndTerms(response) {
+        let body = String(response || '').trim();
+        let newTerms = [];
+
+        if (body.includes('NEW_TERMS:')) {
+            const parts = body.split('NEW_TERMS:');
+            body = parts[0].trim();
+            try {
+                const arrMatch = parts[1].match(/\[[\s\S]*\]/);
+                if (arrMatch) {
+                    newTerms = this._normalizeTerms(JSON.parse(arrMatch[0]));
+                }
+            } catch (e) {}
+        }
+
+        return { body, newTerms };
+    }
+
+    _normalizeTerms(terms) {
+        if (!Array.isArray(terms)) return [];
+        return terms.map(term => {
+            if (!term || typeof term !== 'object') return null;
+            const original = String(term.original || term.source || term.src || '').trim();
+            const translation = String(term.translation || term.target || term.tgt || '').trim();
+            const category = String(term.category || term.type || 'other').trim() || 'other';
+            if (!original || !translation) return null;
+            return { original, translation, category };
+        }).filter(Boolean);
+    }
+
+    _cleanTranslationText(text) {
+        return String(text || '')
+            .replace(/^\s*(?:译文|翻译)\s*[:：]\s*/i, '')
+            .replace(/^["“”']+|["“”']+$/g, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+
+    _extractBatchTranslations(data, originals) {
+if (!data) return null;
+
+const rawItems = Array.isArray(data) ? data
+: Array.isArray(data.translations) ? data.translations
+: Array.isArray(data.items) ? data.items
+: Array.isArray(data.results) ? data.results
+: Array.isArray(data.lines) ? data.lines
+: null;
+
+if (!rawItems || rawItems.length === 0) return null;
+
+const mapped = new Array(originals.length);
+for (let i = 0; i < rawItems.length; i++) {
+const item = rawItems[i];
+let index = i + 1;
+let translation = '';
+let note = '';
+
+if (typeof item === 'string') {
+translation = item;
+} else if (item && typeof item === 'object') {
+const rawIndex = item.index !== undefined ? item.index : (item.id !== undefined ? item.id : item.no);
+const parsedIndex = parseInt(rawIndex, 10);
+if (!isNaN(parsedIndex)) index = parsedIndex;
+translation = item.translation || item.text || item.result || item.target || item.chinese || item.content || '';
+note = item.note || item.annotation || item.comment || '';
+}
+
+translation = this._cleanTranslationText(translation);
+if (!translation || index < 1 || index > originals.length) continue;
+const entry = { original: originals[index - 1], translation: translation };
+if (note && note.trim()) entry.note = note.trim();
+mapped[index - 1] = entry;
+}
+
+return mapped.filter(Boolean).length === originals.length ? mapped : null;
+}
+
+    _extractBatchTranslationsFromText(text, originals) {
+        const normalizedText = String(text || '').replace(/\r\n/g, '\n').replace(/\\n/g, '\n').trim();
+        const mapped = new Array(originals.length);
+        const groups = [];
+        const lines = normalizedText.split(/\n/);
+        let current = null;
+
+        for (let i = 0; i < lines.length; i++) {
+            const rawLine = lines[i];
+            const line = rawLine.trim();
+            if (!line) continue;
+
+            const match = line.match(/^(?:\[)?(\d+)(?:\])?[\.\):：、-]\s*(.*)$/);
+            if (match) {
+                if (current) groups.push(current);
+                current = {
+                    index: parseInt(match[1], 10),
+                    parts: [match[2] || '']
+                };
+            } else if (current) {
+                current.parts.push(line);
+            }
+        }
+        if (current) groups.push(current);
+
+        for (let i = 0; i < groups.length; i++) {
+            const group = groups[i];
+            const index = group.index;
+            const translation = this._cleanTranslationText(group.parts.join('\n'));
+            if (!isNaN(index) && index >= 1 && index <= originals.length && translation) {
+                mapped[index - 1] = { original: originals[index - 1], translation: translation };
+            }
+        }
+
+        if (mapped.filter(Boolean).length === originals.length) return mapped;
+
+        const compactLines = normalizedText.split(/\n+/).map(line => line.trim()).filter(Boolean);
+        if (compactLines.length === originals.length) {
+            return compactLines.map((line, idx) => ({
+                original: originals[idx],
+                translation: this._cleanTranslationText(line.replace(/^\s*(?:\[)?\d+(?:\])?[\.\):：、-]\s*/, ''))
+            }));
+        }
+
+        if (originals.length === 1 && normalizedText) {
+            return [{
+                original: originals[0],
+                translation: this._cleanTranslationText(normalizedText.replace(/^\s*(?:\[)?1(?:\])?[\.\):：、-]\s*/, ''))
+            }];
+        }
+
+        return null;
+    }
+
+    _parseBatchTranslationResponse(response, originals) {
+        const split = this._splitResponseAndTerms(response);
+        const data = Utils.parseJSON(split.body);
+        const items = this._extractBatchTranslations(data, originals) || this._extractBatchTranslationsFromText(split.body, originals);
+        let newTerms = split.newTerms;
+
+        if (data && typeof data === 'object') {
+            newTerms = this._normalizeTerms(data.newTerms || data.terms || data.glossary || newTerms);
+        }
+
+        if (!items || items.length !== originals.length) {
+            const error = new Error('批量译文数量与原句不一致');
+            error._batchParseFailure = true;
+            throw error;
+        }
+
+        return { items, newTerms };
+    }
+
+    _parseTranslationResponse(response, original) {
+        const parsed = this._splitResponseAndTerms(response);
+        return { original, translation: this._cleanTranslationText(parsed.body), newTerms: parsed.newTerms };
+    }
+
+    // ── 摘要生成 ──
+
+    async _updateChapterSummary(chIdx, newText) {
+        const existing = this.chapterSummaries[chIdx] || '';
+        const maxLen = this.config.chapterSummaryLen;
+        // 精简prompt
+        const prompt = `摘要(${maxLen}字内,含人物情节):${existing ? '已有:'+existing.slice(0,30)+'...\n' : ''}${newText.slice(0, 800)}`;
+
+        try {
+            const res = await this.llm.chat(
+                [{ role: 'system', content: `摘要≤${maxLen}字` }, { role: 'user', content: prompt }],
+                { temperature: 0.2, maxTokens: 120 }
+            );
+            this.tokensInput += res.usage.prompt_tokens || 0;
+            this.tokensOutput += res.usage.completion_tokens || 0;
+            this.chapterSummaries[chIdx] = res.content.trim().slice(0, maxLen + 20);
+            this._emit('summaryUpdate', {
+                type: 'chapter',
+                chapterIndex: chIdx,
+                summary: this.chapterSummaries[chIdx],
+            });
+        } catch (e) {
+            console.warn('章节摘要生成失败:', e);
+        }
+    }
+
+    async _updateGlobalSummary() {
+        const allSum = Object.entries(this.chapterSummaries)
+            .sort(([a], [b]) => Number(a) - Number(b))
+            .map(([, v], idx) => `${idx + 1}:${v.slice(0,40)}`)  // 压缩每章摘要
+            .join(';');
+
+        if (!allSum) return;
+        const maxLen = this.config.globalSummaryLen;
+
+        try {
+            const res = await this.llm.chat(
+                [
+                    { role: 'system', content: `合并摘要≤${maxLen}字` },
+                    { role: 'user', content: allSum }
+                ],
+                { temperature: 0.2, maxTokens: 180 }
+            );
+            this.tokensInput += res.usage.prompt_tokens || 0;
+            this.tokensOutput += res.usage.completion_tokens || 0;
+            this.globalSummary = res.content.trim().slice(0, maxLen + 30);
+            this._emit('summaryUpdate', { type: 'global', summary: this.globalSummary });
+        } catch (e) {
+            console.warn('全局摘要生成失败:', e);
+        }
+    }
+
+    // ── 控制 ──
+
+    pause() {
+        this._paused = true;
+        this._pausedAt = Date.now();
+        if (this.llm && this.llm.abortCurrentRequest) this.llm.abortCurrentRequest();
+        this._emit('phase', { phase: 'paused', message: '已暂停' });
+    }
+    
+    resume() { 
+        this._paused = false; 
+        this._pausedAt = null;
+        this._emit('phase', { phase: 'resuming', message: '恢复中...' });
+    }
+    
+    cancel() {
+        this._cancelled = true;
+        this._paused = false;
+        if (this.llm && this.llm.abortCurrentRequest) this.llm.abortCurrentRequest();
+    }
+
+    _isRequestAbortedError(error) {
+        const msg = String(error && error.message || error || '');
+        return /请求已取消|abort|cancel/i.test(msg);
+    }
+    
+    _isPausedError(error) {
+        // 如果在暂停期间发生的错误，不应该计入重试
+        return this._paused || (this._pausedAt && Date.now() - this._pausedAt < 1000);
+    }
+
+    async _checkPauseCancel() {
+        if (this._cancelled) throw new Error('CANCELLED');
+        while (this._paused) {
+            await Utils.sleep(300);
+            if (this._cancelled) throw new Error('CANCELLED');
+        }
+    }
+
+    on(event, handler) {
+        if (!event || typeof handler !== 'function') return () => {};
+        if (!this._listeners[event]) this._listeners[event] = new Set();
+        this._listeners[event].add(handler);
+        return () => this.off(event, handler);
+    }
+
+    off(event, handler) {
+        const bucket = this._listeners[event];
+        if (!bucket) return;
+        bucket.delete(handler);
+        if (bucket.size === 0) delete this._listeners[event];
+    }
+
+    _emit(event, data) {
+        if (this._onProgress) {
+            try { this._onProgress(event, data); } catch (e) { console.warn('Progress callback error:', e); }
+        }
+        const bucket = this._listeners[event];
+        if (!bucket) return;
+        [...bucket].forEach(handler => {
+            try { handler(data, event); } catch (e) { console.warn('Event listener error:', event, e); }
+        });
+    }
+
+    /**
+     * 优化翻译 — 全文翻译完成后，按章节润色
+     * 让AI根据上下文语境优化翻译，使语言更流畅自然
+     */
+    async optimizeTranslation(results, onProgress) {
+        this._onProgress = onProgress;
+        this._cancelled = false;
+        this._paused = false;
+
+        const totalChapters = results.length;
+        let completedChapters = 0;
+
+        this._emit('optimizeStart', { totalChapters });
+
+        const optimizedResults = [];
+
+        for (let chIdx = 0; chIdx < results.length; chIdx++) {
+            await this._checkPauseCancel();
+            const chapter = results[chIdx];
+            if (!chapter || !chapter.sentences || chapter.sentences.length === 0) {
+                optimizedResults.push(chapter);
+                continue;
+            }
+
+            this._emit('optimizeChapterStart', {
+                chapterIndex: chIdx,
+                title: chapter.title,
+                sentenceCount: chapter.sentences.length
+            });
+
+            // 收集章节的原文和译文
+            const pairs = chapter.sentences.map(s => ({
+                original: s.original,
+                translation: s.translation
+            }));
+
+            // 按批次优化（每批约15句，避免上下文过长）
+            const batchSize = 15;
+            const optimizedSentences = [];
+
+            for (let i = 0; i < pairs.length; i += batchSize) {
+                await this._checkPauseCancel();
+                const batch = pairs.slice(i, i + batchSize);
+                const prevContext = i > 0 ? pairs.slice(Math.max(0, i - 3), i) : [];
+                const nextContext = pairs.slice(i + batchSize, i + batchSize + 3);
+
+                const chapterSummary = this.chapterSummaries[chIdx] || '';
+const optimizedBatch = await this._optimizeBatch(batch, prevContext, nextContext, chapter.title, chapterSummary);
+                optimizedSentences.push(...optimizedBatch);
+
+                this._emit('optimizeProgress', {
+                    chapterIndex: chIdx,
+                    completed: Math.min(i + batchSize, pairs.length),
+                    total: pairs.length
+                });
+            }
+
+            optimizedResults.push({
+                ...chapter,
+                sentences: optimizedSentences
+            });
+
+            completedChapters++;
+            this._emit('optimizeChapterComplete', {
+                chapterIndex: chIdx,
+                completedChapters,
+                totalChapters
+            });
+        }
+
+        this._emit('optimizeComplete', { totalChapters });
+        return optimizedResults;
+    }
+
+    async _optimizeBatch(batch, prevContext, nextContext, chapterTitle, chapterSummary) {
+        const glossaryHint = this.glossary.entries.slice(0, 20)
+            .map(e => `${e.original} → ${e.translation}`)
+            .join('\n');
+
+        const contextBefore = prevContext.length > 0
+            ? '前文译文：\n' + prevContext.map(p => p.translation).join('\n') + '\n\n'
+            : '';
+
+        const contextAfter = nextContext.length > 0
+            ? '\n\n后文译文：\n' + nextContext.map(p => p.translation).join('\n')
+            : '';
+
+        const pairsText = batch.map((p, i) =>
+            `[${i + 1}]\n原文: ${p.original}\n译文: ${p.translation}`
+        ).join('\n\n');
+
+        const summaryHint = chapterSummary ? `章节摘要：${chapterSummary}\n` : '';
+
+        const prompt = `你是资深翻译审校编辑。审阅以下原文与译文对照，找出需要修正或润色的译文。
+
+审校与润色标准：
+1. 错误修正：漏译、误译、增译、术语不一致
+2. 表达润色：生硬、不自然、不符合中文习惯的表达
+3. 语境适配：不符合上下文语境、语气不连贯、风格突兀的句子
+4. 文学提升：可以更优美、更传神的表达
+
+${chapterTitle ? '章节：' + chapterTitle + '\n' : ''}${summaryHint}${glossaryHint ? '术语表：\n' + glossaryHint + '\n' : ''}
+${contextBefore}待审内容：
+${pairsText}${contextAfter}
+
+【重要】只输出需要修改的句子，包括：有错误的、表达生硬的、不符合语境的、可以更好的。
+格式：[{"index": 序号, "reason": "修改原因", "fixed": "优化后译文"}, ...]
+
+翻译得好的句子不要输出。如果全部满意，输出空数组 []。
+只输出JSON。`;
+
+        try {
+            const res = await this.llm.chat([{ role: 'user', content: prompt }], {
+                temperature: 0.4,
+                maxTokens: 2000
+            });
+
+            this.tokensInput += res.usage.prompt_tokens || 0;
+            this.tokensOutput += res.usage.completion_tokens || 0;
+
+            const parsed = Utils.parseJSON(res.content);
+            if (Array.isArray(parsed)) {
+                // 只有需要修改/润色的句子才会被更新，其余保持原译文
+                return batch.map((p, i) => {
+                    const fix = parsed.find(x => x.index === i + 1);
+                    return {
+                        original: p.original,
+                        translation: fix && fix.fixed ? fix.fixed : p.translation,
+                        optimizeReason: fix ? fix.reason : null // 记录修改原因便于debug
+                    };
+                });
+            }
+        } catch (e) {
+            console.warn('优化批次失败，保留原译文:', e);
+        }
+
+        // 失败时返回原译文
+        return batch.map(p => ({ original: p.original, translation: p.translation }));
+    }
+    
+    /**
+     * 优化单个章节 - 用于自动优化或手动选择章节优化
+     */
+    async optimizeSingleChapter(chapter, chapterIndex) {
+        return this.optimizeChapterEnhanced(chapter, chapterIndex);
+    }
+    
+    /**
+     * 增强版章节优化 - 带进度事件、结合前后章节摘要、高推理值
+     */
+
+    async optimizeChapterEnhanced(chapter, chapterIndex) {
+        if (!chapter || !chapter.sentences || chapter.sentences.length === 0) {
+            return chapter;
+        }
+
+        this._cancelled = false;
+
+        const pairs = chapter.sentences.map(s => ({
+            original: s.original,
+            translation: s.translation || '',
+            note: s.note
+        }));
+
+        const total = pairs.length;
+        const startTime = Date.now();
+        const summaries = this._collectOptimizeSummaries(chapter, chapterIndex);
+
+        this._emit('optimizeProgress', {
+            chapterIndex,
+            done: 0,
+            total,
+            message: '准备整章润色...'
+        });
+
+        const optimizedSentences = await this._optimizeChapterFull(
+            pairs,
+            chapter.title,
+            summaries
+        );
+
+        this._emit('optimizeChunk', {
+            chapterIndex,
+            startIndex: 0,
+            items: optimizedSentences
+        });
+
+        this._emit('optimizeProgress', {
+            chapterIndex,
+            done: total,
+            total,
+            message: `优化进度: ${total}/${total}`
+        });
+
+        this._emit('optimizeBatch', {
+            type: 'optimize',
+            chapterIndex,
+            title: chapter.title,
+            inputTokens: this._lastInputTokens || 0,
+            outputTokens: this._lastOutputTokens || 0,
+            duration: Date.now() - startTime,
+            batchSize: total,
+            preview: optimizedSentences[0]?.translation?.slice(0, 80) || '',
+            done: total,
+            total
+        });
+
+        return {
+            ...chapter,
+            summary: summaries.current || chapter.summary || '',
+            sentences: optimizedSentences,
+            optimized: true,
+            optimizedAt: Date.now()
+        };
+    }
+
+    _collectOptimizeSummaries(chapter, chapterIndex) {
+        const currentSummary = String(this.chapterSummaries[chapterIndex] || chapter.summary || '').trim();
+        const chapterSummaryMap = {};
+
+        Object.keys(this.chapterSummaries || {}).forEach(key => {
+            const idx = parseInt(key, 10);
+            if (isNaN(idx)) return;
+            const summary = String(this.chapterSummaries[key] || '').trim();
+            if (summary) chapterSummaryMap[idx] = summary;
+        });
+
+        if (currentSummary) {
+            chapterSummaryMap[chapterIndex] = currentSummary;
+        }
+
+        const chapterSummaries = Object.keys(chapterSummaryMap)
+            .map(key => parseInt(key, 10))
+            .filter(idx => !isNaN(idx))
+            .sort((a, b) => a - b)
+            .map(idx => {
+                const titleText = idx === chapterIndex && chapter.title ? `《${chapter.title}》` : '';
+                return `第${idx + 1}章${titleText}：${chapterSummaryMap[idx]}`;
+            });
+
+        return {
+            chapterIndex,
+            current: currentSummary,
+            global: String(this.globalSummary || '').trim(),
+            chapterSummaries
+        };
+    }
+
+    _parseOptimizeChapterResponse(content, pairs) {
+        const parsed = Utils.parseJSON(content);
+        let rawItems = [];
+
+        if (Array.isArray(parsed)) {
+            rawItems = parsed;
+        } else if (parsed && typeof parsed === 'object') {
+            if (Array.isArray(parsed.translations)) rawItems = parsed.translations;
+            else if (Array.isArray(parsed.items)) rawItems = parsed.items;
+            else if (Array.isArray(parsed.sentences)) rawItems = parsed.sentences;
+            else if (Array.isArray(parsed.results)) rawItems = parsed.results;
+        }
+
+        if (!Array.isArray(rawItems) || rawItems.length === 0) {
+            return null;
+        }
+
+        const mapped = new Array(pairs.length);
+
+        for (let i = 0; i < rawItems.length; i++) {
+            const item = rawItems[i];
+            let index = i + 1;
+            let translation = '';
+            let noteValue;
+            let hasExplicitNote = false;
+
+            if (typeof item === 'string') {
+                translation = item;
+            } else if (item && typeof item === 'object') {
+                const rawIndex = item.index !== undefined ? item.index : (item.id !== undefined ? item.id : item.no);
+                const parsedIndex = parseInt(rawIndex, 10);
+                if (!isNaN(parsedIndex)) index = parsedIndex;
+                translation = item.translation || item.text || item.result || item.target || item.chinese || item.content || item.final || '';
+                hasExplicitNote = Object.prototype.hasOwnProperty.call(item, 'note') ||
+                    Object.prototype.hasOwnProperty.call(item, 'annotation') ||
+                    Object.prototype.hasOwnProperty.call(item, 'comment');
+                noteValue = item.note !== undefined ? item.note : (item.annotation !== undefined ? item.annotation : item.comment);
+            }
+
+            translation = this._cleanTranslationText(translation);
+            if (!translation || index < 1 || index > pairs.length) continue;
+
+            const prev = pairs[index - 1] || {};
+            const entry = {
+                original: prev.original,
+                translation
+            };
+
+            if (hasExplicitNote) {
+                const trimmedNote = typeof noteValue === 'string' ? noteValue.trim() : '';
+                if (trimmedNote) entry.note = trimmedNote;
+                else entry.note = '';
+            } else if (prev.note && String(prev.note).trim()) {
+                entry.note = String(prev.note).trim();
+            }
+
+            mapped[index - 1] = entry;
+        }
+
+        if (mapped.filter(Boolean).length !== pairs.length) {
+            return null;
+        }
+
+        return mapped.map((item, idx) => {
+            const result = {
+                original: pairs[idx].original,
+                translation: item.translation
+            };
+            if (item.note && item.note.trim()) result.note = item.note.trim();
+            return result;
+        });
+    }
+
+    _hasMeaningfulOptimizeChange(before, after) {
+        if (!Array.isArray(before) || !Array.isArray(after) || before.length !== after.length) {
+            return false;
+        }
+
+        for (let i = 0; i < before.length; i++) {
+            const prevTranslation = this._cleanTranslationText(before[i]?.translation || '');
+            const nextTranslation = this._cleanTranslationText(after[i]?.translation || '');
+            const prevNote = String(before[i]?.note || '').trim();
+            const nextNote = String(after[i]?.note || '').trim();
+
+            if (prevTranslation !== nextTranslation || prevNote !== nextNote) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * 整章深度优化 - 输出完整润色终稿并整体替换
+     */
+    async _optimizeChapterFull(pairs, chapterTitle, summaries) {
+        summaries = summaries || {};
+
+        const glossaryHint = (this.glossary.entries || [])
+            .filter(e => e && e.original && e.translation)
+            .map(e => `${e.original} → ${e.translation}`)
+            .join('\n');
+
+        const styleHint = this.styleProfile
+            ? `【文风特征】\n${this.styleProfile.style_summary || ''}\n语调: ${this.styleProfile.tone || ''}\n节奏: ${this.styleProfile.rhythm || ''}\n${Array.isArray(this.styleProfile.translation_guidelines) && this.styleProfile.translation_guidelines.length ? '翻译准则: ' + this.styleProfile.translation_guidelines.join('；') + '\n' : ''}\n`
+            : '';
+
+        const summarySections = [];
+        if (summaries.global) summarySections.push(`【全书摘要】\n${summaries.global}`);
+        if (Array.isArray(summaries.chapterSummaries) && summaries.chapterSummaries.length) {
+            summarySections.push(`【现有章节摘要】\n${summaries.chapterSummaries.join('\n')}`);
+        }
+        const summaryContext = summarySections.length ? summarySections.join('\n\n') + '\n\n' : '';
+
+        const pairsText = pairs.map((p, i) =>
+            `[${i + 1}]\n原文: ${p.original}\n当前译文: ${p.translation || ''}${p.note ? '\n现有注释: ' + p.note : ''}`
+        ).join('\n\n');
+
+        const maxTokens = Math.max(3000, Math.min(8000, pairs.length * 100));
+        let attempt = 0;
+
+        while (attempt < 2) {
+            await this._checkPauseCancel();
+
+            const retryHint = attempt > 0
+                ? `\n【重要补充】你上一版输出与当前译文几乎没有差异，未达到“定稿级润色”要求。本次请在忠实原意的前提下，重新逐句打磨：优先消除翻译腔，重组中文语序，调整措辞、节奏、语气和对白质感；不要整章机械照抄当前译文。`
+                : '';
+
+            const prompt = `你是资深文学翻译编辑与中文小说润色作者。请基于“原文 + 当前译文 + 全部现有摘要 + 全部现有术语”，把这一整章直接润色成可替换原译文的最终定稿。
+
+【核心目标】
+1. 严格遵循“信达雅”：忠实原意、中文自然、具有文学质感
+2. 全面消除翻译腔，让成文像成熟中文小说
+3. 保持叙事节奏、情绪基调、人物口吻与上下文一致
+4. 专有名词统一遵循术语表
+5. 对典故、名著、文化梗、俚语、双关、背景知识门槛较高处，可补充简洁注释
+
+【硬性要求】
+- 这是整章终稿，不是局部修改建议
+- 你必须输出整章所有句子的完整最终译文，顺序与输入完全一致
+- 不要解释修改理由，不要写审校说明，不要输出reason字段
+- 如某句需要注释，用 note 字段给出简洁说明，展示时会自动以“【注：...】”形式呈现
+- note 尽量简短，建议 30 字以内
+- 普通句子不要滥加注释
+- 如某句已有注释但你判断无需保留，可输出空字符串 note: ""
+- 除非某句确实已经无法优化，否则不要机械照抄当前译文
+- 最终输出必须是可以直接整体替换当前章节译文的定稿版本${retryHint}
+
+${chapterTitle ? `【当前章节】\n${chapterTitle}\n\n` : ''}${summaryContext}${styleHint}${glossaryHint ? `【术语表】\n${glossaryHint}\n\n` : ''}【待润色章节】
+${pairsText}
+
+【输出格式】
+只输出 JSON 对象，不要额外说明：
+{"translations":[
+  {"index":1,"translation":"润色后的最终译文","note":"可选注释"},
+  {"index":2,"translation":"润色后的最终译文"}
+]}
+
+要求：
+- translations 数量必须等于原句数量
+- index 从 1 开始，顺序与原文严格对应
+- 每一项都必须给出完整 translation
+- 不需要注释时可省略 note 字段`;
+
+            try {
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: attempt > 0 ? 'retrying' : 'requesting',
+                    batch: pairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || ''
+                });
+
+                const res = await this.llm.chat([{ role: 'user', content: prompt }], {
+                temperature: 0.55,
+                maxTokens: maxTokens
+            });
+
+                const content = String(res.content || '');
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: 'received',
+                    batch: pairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    content: content.slice(0, 240) + (content.length > 240 ? '...' : '')
+                });
+
+                this._lastInputTokens = res.usage?.prompt_tokens || 0;
+                this._lastOutputTokens = res.usage?.completion_tokens || 0;
+                this.tokensInput += this._lastInputTokens;
+                this.tokensOutput += this._lastOutputTokens;
+
+                const parsed = this._parseOptimizeChapterResponse(content, pairs);
+                if (parsed) {
+                    if (attempt === 0 && !this._hasMeaningfulOptimizeChange(pairs, parsed)) {
+                        attempt++;
+                        continue;
+                    }
+                    return parsed;
+                }
+
+                if (attempt === 0) {
+                    attempt++;
+                    continue;
+                }
+
+                return pairs.map(p => ({
+                    original: p.original,
+                    translation: p.translation || '',
+                    ...(p.note && String(p.note).trim() ? { note: String(p.note).trim() } : {})
+                }));
+            } catch (e) {
+                if (this._cancelled) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'cancelled',
+                        batch: pairs.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已取消'
+                    });
+                    throw new Error('CANCELLED');
+                }
+                if (this._paused || this._isRequestAbortedError(e)) {
+                    this._emit('apiCall', {
+                        type: 'optimize',
+                        status: 'paused',
+                        batch: pairs.length,
+                        chapterIndex: summaries.chapterIndex,
+                        chapterTitle: chapterTitle || '',
+                        message: '优化已暂停'
+                    });
+                    await this._checkPauseCancel();
+                    continue;
+                }
+                this._emit('apiCall', {
+                    type: 'optimize',
+                    status: 'error',
+                    batch: pairs.length,
+                    chapterIndex: summaries.chapterIndex,
+                    chapterTitle: chapterTitle || '',
+                    message: e.message || '未知错误'
+                });
+                console.warn('整章优化失败，保留原译文:', e);
+
+                if (attempt === 0) {
+                    attempt++;
+                    continue;
+                }
+
+                return pairs.map(p => ({
+                    original: p.original,
+                    translation: p.translation || '',
+                    ...(p.note && String(p.note).trim() ? { note: String(p.note).trim() } : {})
+                }));
+            }
+        }
+
+        return pairs.map(p => ({
+            original: p.original,
+            translation: p.translation || '',
+            ...(p.note && String(p.note).trim() ? { note: String(p.note).trim() } : {})
+        }));
+    }
+
+    /**
+     * 增强版批量优化 - 结合原文和上下文进行深度润色
+     */
+    async _optimizeBatchEnhanced(batch, prevContext, nextContext, chapterTitle, chapterSummary) {
+        const glossaryHint = this.glossary.entries.slice(0, 30)
+            .map(e => `${e.original} → ${e.translation}`)
+            .join('\n');
+        
+        const styleHint = this.styleProfile 
+            ? `文风：${this.styleProfile.style_summary || ''}\n` 
+            : '';
+        
+        const contextBefore = prevContext.length > 0
+            ? '【前文参考】\n' + prevContext.map(p => `原: ${p.original}\n译: ${p.translation}`).join('\n') + '\n\n'
+            : '';
+        
+        const contextAfter = nextContext.length > 0
+            ? '\n\n【后文参考】\n' + nextContext.map(p => `原: ${p.original}\n译: ${p.translation}`).join('\n')
+            : '';
+        
+        const pairsText = batch.map((p, i) =>
+            `[${i + 1}]\n原文: ${p.original}\n译文: ${p.translation}${p.note ? '\n注释: ' + p.note : ''}`
+        ).join('\n\n');
+        
+        const summaryHint = chapterSummary ? `章节摘要：${chapterSummary}\n` : '';
+        
+        const prompt = `你是资深文学翻译审校编辑，精通中英文表达。请审阅以下原文与译文对照，进行深度润色优化。
+
+【优化目标】
+1. 信：准确传达原文意思，纠正漏译/误译/增译
+2. 达：符合中文表达习惯，语句通顺不拗口
+3. 雅：提升文学性，让译文流畅优美、朗朗上口
+
+【具体要求】
+- 调整语序使更符合中文习惯
+- 补充必要的文化注释（如典故、名著引用等，用note字段）
+- 保持上下文语气连贯
+- 避免翻译腔和生硬表达
+- 专有名词保持术语表一致性
+
+${chapterTitle ? '章节：' + chapterTitle + '\n' : ''}${summaryHint}${styleHint}${glossaryHint ? '术语表：\n' + glossaryHint + '\n' : ''}
+${contextBefore}【待优化内容】
+${pairsText}${contextAfter}
+
+【输出格式】
+只输出需要修改的句子，JSON数组：
+[{"index": 序号, "reason": "修改原因", "fixed": "优化后译文", "note": "可选注释"}]
+
+翻译已经很好的句子不要输出。全部满意则输出 []。
+只输出JSON，不要其他内容。`;
+
+        try {
+            const res = await this.llm.chat([{ role: 'user', content: prompt }], {
+                temperature: 0.35,
+                maxTokens: 2500
+            });
+            
+            this.tokensInput += res.usage.prompt_tokens || 0;
+            this.tokensOutput += res.usage.completion_tokens || 0;
+            
+            const parsed = Utils.parseJSON(res.content);
+            if (Array.isArray(parsed)) {
+                return batch.map((p, i) => {
+                    const fix = parsed.find(x => x.index === i + 1);
+                    return {
+                        original: p.original,
+                        translation: fix && fix.fixed ? fix.fixed : p.translation,
+                        note: fix && fix.note ? fix.note : p.note,
+                        optimizeReason: fix ? fix.reason : null
+                    };
+                });
+            }
+        } catch (e) {
+            console.warn('增强优化失败，保留原译文:', e);
+        }
+        
+        return batch.map(p => ({ original: p.original, translation: p.translation, note: p.note }));
+    }
+}
