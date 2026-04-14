@@ -41,5 +41,3 @@ logs/
 # Project specific
 *.tmp
 *.temp
-# Operit workspace backup
-.backup/
