@@ -159,9 +159,11 @@ class LLMAdapter {
         if (reasoningMode === 'effort' && options.reasoningEffort) payload.reasoning_effort = options.reasoningEffort;
         if (reasoningMode === 'object' && options.reasoning && typeof options.reasoning === 'object') payload.reasoning = options.reasoning;
 
+        // 如果是特定易被 CORS 拦截的中转站，改用 text/plain 绕过 OPTIONS 预检请求
+        const contentType = this.baseUrl.includes('ccroute.net') ? 'text/plain' : 'application/json';
         const response = await this._fetchWithTimeout(this.baseUrl + '/chat/completions', {
             method: 'POST',
-            headers: { 'Content-Type':'application/json', 'Authorization':'Bearer ' + this.currentKey },
+            headers: { 'Content-Type': contentType, 'Authorization':'Bearer ' + this.currentKey },
             body: JSON.stringify(payload),
         });
 

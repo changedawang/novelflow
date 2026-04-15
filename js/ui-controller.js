@@ -2162,9 +2162,9 @@ this._rdMode = p.mode||'translated';
         badge.textContent = isComplete ? '已完成' : pct + '%';
         badge.classList.toggle('complete', isComplete);
         badge.classList.toggle('hidden', false);
-        // 翻译中/暂停时显示实况按钮
+        // 只要没完成，就始终显示控制面板入口（允许续传/重新控制）
         if (liveBtn) {
-            liveBtn.style.display = (book.status === 'translating' || book.status === 'paused') ? '' : 'none';
+            liveBtn.style.display = isComplete ? 'none' : '';
         }
     }
     _prepareReaderEngine(book) {
