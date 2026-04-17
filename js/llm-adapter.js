@@ -364,8 +364,10 @@ class LLMAdapter {
 
         let lastError = '';
 
-        // 策略: 对每个URL先尝试不带Auth头的简单请求(避免CORS预检)，
-        // 失败再尝试带Auth头的请求
+        // 策略: 对每个URL依次尝试:
+        // 1. 不带Auth头的简单GET请求(避免CORS预检)
+        // 2. 带Auth头的GET请求
+        // 3. 通过CORS代理转发(解决服务端完全不支持CORS的情况)
         for (const url of urls) {
             // --- 尝试1: 不带 Authorization (简单请求，不触发CORS预检) ---
             try {
@@ -399,8 +401,25 @@ class LLMAdapter {
                     lastError = e.message || '网络错误';
                 }
             }
+
+            // --- 尝试3: 通过CORS代理获取(解决服务端无CORS头的情况) ---
+            const corsProxies = [
+                'https://api.codetabs.com/v1/proxy/?quest=',
+                'https://api.allorigins.win/raw?url='
+            ];
+            for (const proxy of corsProxies) {
+                try {
+                    const proxyUrl = proxy + encodeURIComponent(url);
+                    const r3 = await this._fetchWithTimeout(proxyUrl, { method: 'GET' });
+                    if (r3.ok) {
+                        const data = await r3.json();
+                        const models = this._parseModelsResponse(data);
+                        if (models && models.length > 0) return models;
+                    }
+                } catch (e) { /* 静默，继续下一代理 */ }
+            }
         }
-        throw new Error(`获取模型失败: ${lastError}。该 API 可能不支持模型列表接口，请手动输入模型名称。`);
+        throw new Error(`获取模型失败: ${lastError}。该 API 可能不支持跨域(CORS)访问或模型列表接口，请手动输入模型名称。`);
     }
     countTokens(text) { return Utils.estimateTokens(text); }
 }

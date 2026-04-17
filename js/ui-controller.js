@@ -2339,34 +2339,47 @@ try {
 }
 }
 
-async _retranslateSentence(sentIdx){
-if(!confirm('确定重新翻译这句话？')) return;
-const chapters = this._getReaderChapters(this._rdBook);
-const ch = chapters[this._rdChIdx];
-if(!ch || !ch.sentences[sentIdx]) return;
-const s = ch.sentences[sentIdx];
-const original = s.original;
+    async _retranslateSentence(sentIdx){
+        if(!confirm('确定重新翻译这句话？')) return;
+        const chapters = this._getReaderChapters(this._rdBook);
+        const ch = chapters[this._rdChIdx];
+        if(!ch || !ch.sentences[sentIdx]) return;
+        const s = ch.sentences[sentIdx];
+        const original = s.original;
+        
+        try {
+            // UI 反馈
+            const btn = document.querySelector(`.reader-actions[data-idx="${sentIdx}"] .ra-retrans`);
+            if (btn) btn.textContent = '⏳';
 
-try {
-    const adapter = this._createLLMAdapter();
-    const prompt_text = `将以下句子翻译为${this._rdBook.targetLang || '简体中文'}，只输出译文：\n${original}`;
-    const res = await adapter.chat([{role:'user', content:prompt_text}], {temperature:0.3, maxTokens:200});
-    const newTrans = res.content.trim();
-    
-    // 更新数据
-    const results = Utils.loadLocal(`results-${this._rdBook.id}`, []);
-    if(results[this._rdChIdx] && results[this._rdChIdx].sentences[sentIdx]) {
-        results[this._rdChIdx].sentences[sentIdx].translation = newTrans;
-        Utils.saveLocal(`results-${this._rdBook.id}`, results);
-        // 刷新显示
-        this._rdBook.results = results;
-        this._goChapter(this._rdChIdx);
-        alert('✅ 重新翻译完成');
+            const adapter = this._createLLMAdapter();
+            const prompt_text = `你是一个顶级文学翻译家。请将下面的句子翻译为${this._rdBook.targetLang || '简体中文'}，要求信达雅，仅输出译文，不要有任何多余的解释：\n\n${original}`;
+            const res = await adapter.chat([{role:'user', content:prompt_text}], {temperature:0.3, maxTokens:500});
+            let newTrans = res.content.trim();
+            
+            // 简单清理可能带上的引号
+            if (newTrans.startsWith('“') && newTrans.endsWith('”') && !original.startsWith('"')) {
+                newTrans = newTrans.slice(1, -1);
+            }
+            
+            // 同时更新 chapters 和 results
+            ch.sentences[sentIdx].translation = newTrans;
+            this._saveReadingProgress(); // 保存 chapters 到本地
+            
+            const results = Utils.loadLocal(`results-${this._rdBook.id}`, []);
+            if(results[this._rdChIdx] && results[this._rdChIdx].sentences[sentIdx]) {
+                results[this._rdChIdx].sentences[sentIdx].translation = newTrans;
+                Utils.saveLocal(`results-${this._rdBook.id}`, results);
+                this._rdBook.results = results;
+            }
+            
+            // 刷新显示
+            this._goChapter(this._rdChIdx);
+        } catch(e) {
+            alert('重新翻译失败：' + e.message);
+            this._goChapter(this._rdChIdx); // 恢复原样
+        }
     }
-} catch(e) {
-    alert('翻译失败：' + e.message);
-}
-}
 
 _createLLMAdapter(){
 const s = this.settings;
