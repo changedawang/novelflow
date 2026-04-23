@@ -2067,37 +2067,6 @@ const noteHtml = (translated && translated.note) ? `<div class="live-note">📝 
             return;
         }
         
-        // Add clickable detail panel for request/response inspection
-        const cachedReq = d.requestId && this._apiRequestCache ? this._apiRequestCache[d.requestId] : null;
-        const detailParts = [];
-        if (cachedReq && cachedReq.messages) {
-            detailParts.push('<b>📤 请求 Messages:</b>\n' + Utils.escapeHtml(JSON.stringify(cachedReq.messages, null, 2)));
-        }
-        if (cachedReq && cachedReq.options) {
-            detailParts.push('<b>⚙️ 请求 Options:</b>\n' + Utils.escapeHtml(JSON.stringify(cachedReq.options, null, 2)));
-        }
-        if (d.content || d.contentPreview) {
-            detailParts.push('<b>📥 返回 Content:</b>\n' + Utils.escapeHtml(String(d.content || d.contentPreview || '')));
-        }
-        if (d.reasoning) {
-            detailParts.push('<b>🧠 返回 Reasoning:</b>\n' + Utils.escapeHtml(String(d.reasoning || '')));
-        }
-        if (d.usage) {
-            detailParts.push('<b>📊 Usage:</b>\n' + Utils.escapeHtml(JSON.stringify(d.usage, null, 2)));
-        }
-        if (d.message && d.status === 'error') {
-            detailParts.push('<b>❌ 错误信息:</b>\n' + Utils.escapeHtml(String(d.message || '')));
-        }
-        if (detailParts.length > 0) {
-            const details = document.createElement('details');
-            details.style.cssText = 'margin-top:6px;font-size:0.75rem';
-            details.innerHTML = '<summary style="cursor:pointer;color:var(--accent);user-select:none">📋 点击查看详细信息</summary>'
-                + '<div style="margin-top:6px;white-space:pre-wrap;line-height:1.4;color:var(--text-dim);max-height:400px;overflow-y:auto;padding:8px;background:var(--bg-secondary);border-radius:6px;word-break:break-all">'
-                + detailParts.join('\n\n')
-                + '</div>';
-            entry.appendChild(details);
-        }
-        
         container.appendChild(entry);
         
         this._logCount = (this._logCount || 0) + 1;
