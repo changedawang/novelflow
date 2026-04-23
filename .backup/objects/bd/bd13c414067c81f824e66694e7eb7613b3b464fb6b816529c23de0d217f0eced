@@ -596,22 +596,18 @@ class TranslationEngine {
     }
 
     _buildBatchPrompt(sentences, context) {
-const systemPrompt = `你是一位顶级文学翻译大师，精通原语言与${this.config.targetLang}之间的文化差异和语言特性。
-
-【翻译核心原则】
-1. 理解优先：先深入理解每句话在上下文中的真实含义、情感和语气，再用${this.config.targetLang}重新创作
-2. 地道表达：译文应读起来像${this.config.targetLang}原创小说，而非翻译作品。避免欧化长句、被动语态堆砌等翻译腔
-3. 人物区分：不同角色的对话应体现不同的说话风格和性格特征。对话要口语化、鲜活
-4. 叙述质感：叙述文字要有文学韵味，注意节奏感和画面感
-5. 句式多变：避免所有句子用相同句式开头或结构，灵活调整语序
-6. 术语一致：严格遵循术语表中的译名
-
-先充分推理思考，再输出最终结果，但不要把推理过程写进translation或note。严格只输出JSON。
+const systemPrompt = `你是专业文学翻译，遵循"信达雅"原则翻译为${this.config.targetLang}：
+- 信：准确传达原意，不增不减
+- 达：通顺流畅，符合目标语言表达习惯
+- 雅：保持原文的文学性、语气、基调
+跟随原文风格变化。遵循术语表保持一致。严格输出JSON。
+可以先充分推理，再给出最终结果，但不要把推理过程写进translation或note。
 
 【注释规则】遇到以下内容时，用note字段添加15字以内的简短注释：
-- 书名/名著/文学引用/典故（简述出处和含义）
+- 书名/名著（如Black Beauty→注释：英国经典儿童小说，讲述一匹马的一生）
+- 文学引用/典故（简述出处和含义）
 - 俚语/双关语（解释字面外的含义）
-- 需要背景知识才能理解的文化内容
+- 需要背景知识才能理解的内容
 普通句子不加note。`;
 
 const parts = this._buildPromptContextParts(context, sentences.join(' ').length);

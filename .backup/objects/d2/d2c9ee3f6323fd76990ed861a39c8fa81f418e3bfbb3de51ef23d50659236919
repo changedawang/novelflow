@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NovelFlow — AI 小说翻译书架</title>
-    <link rel="stylesheet" href="css/style.css?v=20260416e">
-<link rel="stylesheet" href="css/components.css?v=20260416e">
+    <link rel="stylesheet" href="css/style.css?v=20260416d">
+<link rel="stylesheet" href="css/components.css?v=20260416d">
     <!-- 免费中文字体 -->
     <link href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-screen-webfont@1.7.0/style.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=Noto+Sans+SC:wght@400;500;700&family=Ma+Shan+Zheng&family=ZCOOL+XiaoWei&family=ZCOOL+KuaiLe&family=ZCOOL+QingKe+HuangYou&family=Liu+Jian+Mao+Cao&family=Zhi+Mang+Xing&family=Long+Cang&display=swap" rel="stylesheet">
@@ -392,9 +392,8 @@
                             <option value="low">低 — 快速润色</option>
                             <option value="medium">中 — 均衡</option>
                             <option value="high" selected>高 — 深度润色（推荐）</option>
-<option value="xhigh">超高 — 极致润色</option>
-</select>
-</div>
+                        </select>
+                    </div>
                     <div class="fg" style="display:flex;align-items:center;gap:12px">
                         <label style="flex:1;margin:0">📡 显示思维链 <span style="font-weight:400;font-size:.72rem;color:var(--text-dim)">（日志中实时显示 AI 推理过程）</span></label>
                         <input type="checkbox" id="api-show-reasoning" checked style="width:18px;height:18px">
@@ -443,12 +442,12 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-<script src="js/utils.js?v=20260416e"></script>
-<script src="js/llm-adapter.js?v=20260416e"></script>
-<script src="js/text-splitter.js?v=20260416e"></script>
-<script src="js/glossary-manager.js?v=20260416e"></script>
-<script src="js/translation-engine.js?v=20260416e"></script>
-<script src="js/ui-controller.js?v=20260416e"></script>
-<script src="js/app.js?v=20260416e"></script>
+<script src="js/utils.js?v=20260416d"></script>
+<script src="js/llm-adapter.js?v=20260416d"></script>
+<script src="js/text-splitter.js?v=20260416d"></script>
+<script src="js/glossary-manager.js?v=20260416d"></script>
+<script src="js/translation-engine.js?v=20260416d"></script>
+<script src="js/ui-controller.js?v=20260416d"></script>
+<script src="js/app.js?v=20260416d"></script>
 </body>
 </html>
