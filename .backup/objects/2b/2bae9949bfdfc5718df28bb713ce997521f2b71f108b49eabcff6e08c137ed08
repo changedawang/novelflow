@@ -1,0 +1,636 @@
+/**
+ * NovelFlow — UI Controller v2
+ * 负责所有界面交互、阶段切换、进度显示、导出
+ */
+class UIController {
+    constructor() {
+        this.engine = null;
+        this.glossary = null;
+        this.splitter = new TextSplitter();
+        this.llm = null;
+
+        this.chapters = [];
+        this.sentences = [];
+        this.fileName = '';
+        this.rawText = '';
+        this._isPaused = false;
+
+        this._cacheDOM();
+        this._bindEvents();
+        this._loadSettings();
+    }
+
+    /* ══════════════════════════════
+       DOM 缓存
+    ══════════════════════════════ */
+    _cacheDOM() {
+        // Phases
+        this.$upload = document.getElementById('phase-upload');
+        this.$preview = document.getElementById('phase-preview');
+        this.$translate = document.getElementById('phase-translate');
+
+        // Upload
+        this.$uploadArea = document.getElementById('upload-area');
+        this.$fileInput = document.getElementById('file-input');
+        this.$btnChoose = document.getElementById('btn-choose-file');
+        this.$btnDemo = document.getElementById('btn-demo');
+
+        // Preview
+        this.$fileName = document.getElementById('file-name');
+        this.$previewText = document.getElementById('preview-text');
+        this.$statChars = document.getElementById('stat-chars');
+        this.$statSentences = document.getElementById('stat-sentences');
+        this.$statChapters = document.getElementById('stat-chapters');
+        this.$statTokens = document.getElementById('stat-tokens');
+        this.$btnReUpload = document.getElementById('btn-re-upload');
+        this.$btnStart = document.getElementById('btn-start');
+        this.$targetLang = document.getElementById('target-lang');
+        this.$contextWindow = document.getElementById('context-window');
+        this.$autoGlossary = document.getElementById('auto-glossary');
+        this.$autoStyle = document.getElementById('auto-style');
+
+        // Translate
+        this.$statusBar = document.getElementById('status-bar');
+        this.$statusPhase = document.getElementById('status-phase');
+        this.$statusDetail = document.getElementById('status-detail');
+        this.$statusTokens = document.getElementById('status-tokens');
+        this.$progressFill = document.getElementById('progress-fill');
+        this.$progressLabel = document.getElementById('progress-label');
+        this.$progressPercent = document.getElementById('progress-percent');
+        this.$btnPause = document.getElementById('btn-pause');
+        this.$btnCancel = document.getElementById('btn-cancel');
+        this.$sourceList = document.getElementById('source-list');
+        this.$targetList = document.getElementById('target-list');
+        this.$pauseAlert = document.getElementById('pause-alert');
+        this.$btnResumeAlert = document.getElementById('btn-resume-alert');
+        this.$completeBanner = document.getElementById('complete-banner');
+        this.$completeSummary = document.getElementById('complete-summary');
+        this.$btnExportComplete = document.getElementById('btn-export-complete');
+        this.$btnNewTask = document.getElementById('btn-new-task');
+        this.$glossaryCount = document.getElementById('glossary-count');
+        this.$glossaryBody = document.getElementById('glossary-body');
+        this.$glossarySearch = document.getElementById('glossary-search');
+        this.$styleContent = document.getElementById('style-content');
+        this.$summaryContent = document.getElementById('summary-content');
+
+        // Header
+        this.$btnSettings = document.getElementById('btn-settings');
+        this.$btnExport = document.getElementById('btn-export');
+
+        // Modals
+        this.$modalSettings = document.getElementById('modal-settings');
+        this.$modalAddTerm = document.getElementById('modal-add-term');
+        this.$modalExport = document.getElementById('modal-export');
+
+        // Settings form
+        this.$apiProvider = document.getElementById('api-provider');
+        this.$apiKey = document.getElementById('api-key');
+        this.$apiBaseUrl = document.getElementById('api-base-url');
+        this.$customUrlGroup = document.getElementById('custom-url-group');
+        this.$apiModel = document.getElementById('api-model');
+        this.$apiTemp = document.getElementById('api-temperature');
+        this.$apiMaxTokens = document.getElementById('api-max-tokens');
+    }
+
+    /* ══════════════════════════════
+       事件绑定
+    ══════════════════════════════ */
+    _bindEvents() {
+        // Upload
+        this.$btnChoose.onclick = () => this.$fileInput.click();
+        this.$fileInput.onchange = (e) => this._handleFile(e.target.files[0]);
+        this.$btnDemo.onclick = () => this._loadDemo();
+
+        // Drag & drop
+        this.$uploadArea.ondragover = (e) => { e.preventDefault(); this.$uploadArea.classList.add('drag-over'); };
+        this.$uploadArea.ondragleave = () => this.$uploadArea.classList.remove('drag-over');
+        this.$uploadArea.ondrop = (e) => {
+            e.preventDefault();
+            this.$uploadArea.classList.remove('drag-over');
+            const f = e.dataTransfer.files[0];
+            if (f) this._handleFile(f);
+        };
+
+        // Preview
+        this.$btnReUpload.onclick = () => this._showPhase('upload');
+        this.$btnStart.onclick = () => this._startTranslation();
+
+        // Translate controls
+        this.$btnPause.onclick = () => this._togglePause();
+        this.$btnCancel.onclick = () => this._cancelTranslation();
+        this.$btnResumeAlert.onclick = () => this._togglePause();
+        this.$btnExportComplete.onclick = () => this._showModal('export');
+        this.$btnNewTask.onclick = () => { location.reload(); };
+
+        // Header
+        this.$btnSettings.onclick = () => this._showModal('settings');
+        this.$btnExport.onclick = () => this._showModal('export');
+
+        // Tabs
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.onclick = () => this._switchTab(tab.dataset.tab);
+        });
+
+        // Settings
+        this.$apiProvider.onchange = () => {
+            this.$customUrlGroup.classList.toggle('hidden', this.$apiProvider.value !== 'custom');
+        };
+        document.getElementById('btn-save-settings').onclick = () => this._saveSettings();
+
+        // Add term
+        document.getElementById('btn-add-term').onclick = () => this._showModal('addTerm');
+        document.getElementById('btn-confirm-add-term').onclick = () => this._addTerm();
+
+        // Glossary search
+        this.$glossarySearch.oninput = () => this._renderGlossary();
+
+        // Import glossary
+        document.getElementById('btn-import-glossary').onclick = () => this._importGlossary();
+
+        // Export options
+        document.querySelectorAll('.export-option').forEach(opt => {
+            opt.onclick = () => this._doExport(opt.dataset.format);
+        });
+    }
+
+    /* ══════════════════════════════
+       阶段切换
+    ══════════════════════════════ */
+    _showPhase(phase) {
+        this.$upload.classList.toggle('hidden', phase !== 'upload');
+        this.$preview.classList.toggle('hidden', phase !== 'preview');
+        this.$translate.classList.toggle('hidden', phase !== 'translate');
+        this.$btnExport.style.display = phase === 'translate' ? '' : 'none';
+    }
+
+    /* ══════════════════════════════
+       文件处理
+    ══════════════════════════════ */
+    _handleFile(file) {
+        if (!file) return;
+        this.fileName = file.name;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            this.rawText = e.target.result;
+            this._analyzeText();
+            this._showPhase('preview');
+        };
+        reader.readAsText(file);
+    }
+
+    _loadDemo() {
+        if (typeof DEMO_TEXT === 'undefined') { alert('演示文本未加载'); return; }
+        this.fileName = 'demo-lord-of-the-rings.txt';
+        this.rawText = DEMO_TEXT;
+        this._analyzeText();
+        this._showPhase('preview');
+    }
+
+    _analyzeText() {
+        this.chapters = this.splitter.splitChapters(this.rawText);
+        this.sentences = [];
+        this.chapters.forEach(ch => {
+            const sents = this.splitter.splitSentences(ch.content);
+            sents.forEach(s => this.sentences.push({ chapter: ch.title, text: s }));
+        });
+
+        this.$fileName.textContent = this.fileName;
+        this.$statChars.textContent = formatNumber(this.rawText.length);
+        this.$statSentences.textContent = formatNumber(this.sentences.length);
+        this.$statChapters.textContent = this.chapters.length;
+        this.$statTokens.textContent = formatNumber(estimateTokens(this.rawText));
+        this.$previewText.textContent = this.rawText.slice(0, 500) + (this.rawText.length > 500 ? '...' : '');
+    }
+
+    /* ══════════════════════════════
+       翻译流程
+    ══════════════════════════════ */
+    async _startTranslation() {
+        // 验证 API Key
+        const apiKey = this.$apiKey.value || loadLocal('nf_apiKey', '');
+        if (!apiKey) {
+            this._showModal('settings');
+            alert('请先设置 API Key');
+            return;
+        }
+
+        this._showPhase('translate');
+        this._isPaused = false;
+        this.$completeBanner.classList.add('hidden');
+
+        // 初始化 LLM
+        const provider = this.$apiProvider.value;
+        const config = {
+            apiKey,
+            model: this.$apiModel.value || undefined,
+            temperature: parseFloat(this.$apiTemp.value) || 0.3,
+            maxTokens: parseInt(this.$apiMaxTokens.value) || 1024,
+        };
+        if (provider === 'custom') config.baseUrl = this.$apiBaseUrl.value;
+        this.llm = new LLMAdapter(provider, config);
+
+        // 初始化术语表
+        this.glossary = new GlossaryManager();
+
+        // 初始化翻译引擎
+        this.engine = new TranslationEngine(this.llm, this.glossary, {
+            targetLang: this.$targetLang.value,
+            contextWindow: parseInt(this.$contextWindow.value) || 8,
+            autoGlossary: this.$autoGlossary.checked,
+            autoStyle: this.$autoStyle.checked,
+        });
+
+        // 渲染句子列表
+        this._renderSentences();
+
+        // 绑定引擎事件
+        this.engine.on('progress', (data) => this._handleProgress(data));
+        this.engine.on('glossaryUpdate', () => this._renderGlossary());
+        this.engine.on('styleUpdate', (style) => this._renderStyle(style));
+        this.engine.on('summaryUpdate', (summary) => this._renderSummary(summary));
+        this.engine.on('error', (data) => this._showErrorToast(data.message));
+        this.engine.on('autoPaused', () => this._onAutoPaused());
+
+        // 开始
+        try {
+            await this.engine.translate(this.sentences);
+            if (!this.engine._cancelled) {
+                this._onComplete();
+            }
+        } catch (err) {
+            console.error('Translation error:', err);
+            this._showErrorToast('翻译出错: ' + err.message);
+        }
+    }
+
+    _renderSentences() {
+        this.$sourceList.innerHTML = '';
+        this.$targetList.innerHTML = '';
+
+        this.sentences.forEach((s, i) => {
+            const srcRow = document.createElement('div');
+            srcRow.className = 'sentence-row';
+            srcRow.id = `src-${i}`;
+            srcRow.innerHTML = `<span class="sentence-idx">${i + 1}</span><span class="sentence-text">${escapeHtml(s.text)}</span>`;
+            this.$sourceList.appendChild(srcRow);
+
+            const tgtRow = document.createElement('div');
+            tgtRow.className = 'sentence-row';
+            tgtRow.id = `tgt-${i}`;
+            tgtRow.innerHTML = `<span class="sentence-idx">${i + 1}</span><span class="sentence-text pending">等待翻译...</span>`;
+            this.$targetList.appendChild(tgtRow);
+        });
+    }
+
+    /* ══════════════════════════════
+       进度处理
+    ══════════════════════════════ */
+    _handleProgress(data) {
+        const { phase, current, total, translated, tokens } = data;
+
+        // 进度条
+        if (total > 0) {
+            const pct = Math.round((current / total) * 100);
+            this.$progressFill.style.width = pct + '%';
+            this.$progressLabel.textContent = `${current} / ${total} 句`;
+            this.$progressPercent.textContent = pct + '%';
+        }
+
+        // 状态文字
+        const phaseNames = {
+            'glossary': '📚 提取术语中...',
+            'style': '🎨 分析文风中...',
+            'translating': '✍️ 翻译中',
+            'summary': '📋 生成摘要中...',
+        };
+        this.$statusPhase.textContent = phaseNames[phase] || phase;
+        this.$statusDetail.textContent = data.detail || '';
+
+        // Token 统计
+        if (tokens) {
+            this.$statusTokens.textContent = `Tokens: ${formatNumber(tokens)}`;
+        }
+
+        // 更新译文显示
+        if (translated && current > 0) {
+            const idx = current - 1;
+            const tgtRow = document.getElementById(`tgt-${idx}`);
+            if (tgtRow) {
+                const textEl = tgtRow.querySelector('.sentence-text');
+                if (translated === '__FAILED__') {
+                    textEl.className = 'sentence-text failed';
+                    textEl.textContent = '❌ 翻译失败';
+                } else {
+                    textEl.className = 'sentence-text';
+                    textEl.textContent = translated;
+                }
+            }
+
+            // 高亮当前句
+            document.querySelectorAll('.sentence-row.current').forEach(el => el.classList.remove('current'));
+            const nextSrc = document.getElementById(`src-${current}`);
+            const nextTgt = document.getElementById(`tgt-${current}`);
+            if (nextSrc) { nextSrc.classList.add('current'); nextSrc.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+            if (nextTgt) { nextTgt.classList.add('current'); nextTgt.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+        }
+    }
+
+    /* ══════════════════════════════
+       暂停 / 恢复 / 取消
+    ══════════════════════════════ */
+    _togglePause() {
+        if (!this.engine) return;
+        this._isPaused = !this._isPaused;
+
+        if (this._isPaused) {
+            this.engine.pause();
+            this.$btnPause.textContent = '▶ 继续';
+            this.$btnPause.classList.remove('btn-outline');
+            this.$btnPause.classList.add('btn-primary');
+            this._setStatusBarState('warning');
+        } else {
+            this.engine.resume();
+            this.$btnPause.textContent = '⏸ 暂停';
+            this.$btnPause.classList.remove('btn-primary');
+            this.$btnPause.classList.add('btn-outline');
+            this._setStatusBarState('normal');
+            this._hidePauseAlert();
+        }
+    }
+
+    _onAutoPaused() {
+        this._isPaused = true;
+        this.$btnPause.textContent = '▶ 继续';
+        this.$btnPause.classList.remove('btn-outline');
+        this.$btnPause.classList.add('btn-primary');
+        this._setStatusBarState('error');
+        this.$pauseAlert.classList.add('visible');
+    }
+
+    _hidePauseAlert() {
+        this.$pauseAlert.classList.remove('visible');
+    }
+
+    _cancelTranslation() {
+        if (!this.engine) return;
+        if (!confirm('确定要取消翻译吗？已翻译的内容可以导出。')) return;
+        this.engine.cancel();
+        this.$statusPhase.textContent = '已取消';
+        this._setStatusBarState('warning');
+    }
+
+    _setStatusBarState(state) {
+        this.$statusBar.className = 'status-bar';
+        if (state !== 'normal') {
+            this.$statusBar.classList.add(`status-bar--${state}`);
+        }
+    }
+
+    _showErrorToast(message) {
+        const toast = document.createElement('div');
+        toast.className = 'error-toast';
+        toast.textContent = '⚠️ ' + message;
+        document.body.appendChild(toast);
+        setTimeout(() => { toast.remove(); }, 4000);
+    }
+
+    /* ══════════════════════════════
+       翻译完成
+    ══════════════════════════════ */
+    _onComplete() {
+        this._setStatusBarState('success');
+        this.$statusPhase.textContent = '✅ 翻译完成';
+        this.$progressFill.style.width = '100%';
+        this.$progressPercent.textContent = '100%';
+
+        const results = this.engine.getResults();
+        const translated = results.filter(r => r.translated && r.translated !== '__FAILED__').length;
+        this.$completeSummary.textContent = `共翻译 ${translated} / ${results.length} 句，消耗 ${formatNumber(this.engine.totalTokens)} Tokens`;
+        this.$completeBanner.classList.remove('hidden');
+    }
+
+    /* ══════════════════════════════
+       标签页切换
+    ══════════════════════════════ */
+    _switchTab(tabName) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        document.getElementById(`panel-${tabName}`).classList.add('active');
+    }
+
+    /* ══════════════════════════════
+       术语表渲染
+    ══════════════════════════════ */
+    _renderGlossary() {
+        if (!this.glossary) return;
+        const terms = this.glossary.getAll();
+        const search = this.$glossarySearch.value.toLowerCase();
+        const filtered = search
+            ? terms.filter(t => t.source.toLowerCase().includes(search) || t.target.toLowerCase().includes(search))
+            : terms;
+
+        this.$glossaryCount.textContent = terms.length;
+
+        const catClass = { character: 'cat-character', location: 'cat-location', item: 'cat-item', organization: 'cat-organization', concept: 'cat-concept' };
+        const catLabel = { character: '角色', location: '地点', item: '物品', organization: '组织', concept: '概念', other: '其他' };
+
+        this.$glossaryBody.innerHTML = filtered.map(t => `
+            <tr>
+                <td><strong>${escapeHtml(t.source)}</strong></td>
+                <td>${escapeHtml(t.target)}</td>
+                <td><span class="term-category ${catClass[t.category] || 'cat-other'}">${catLabel[t.category] || t.category}</span></td>
+                <td>
+                    <div class="term-actions">
+                        <button onclick="ui._toggleLock('${escapeHtml(t.source)}')" title="锁定" class="${t.locked ? 'term-locked' : ''}">🔒</button>
+                        <button onclick="ui._deleteTerm('${escapeHtml(t.source)}')" title="删除">🗑</button>
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    _toggleLock(source) {
+        const term = this.glossary.get(source);
+        if (term) {
+            term.locked = !term.locked;
+            this._renderGlossary();
+        }
+    }
+
+    _deleteTerm(source) {
+        this.glossary.remove(source);
+        this._renderGlossary();
+    }
+
+    _addTerm() {
+        const source = document.getElementById('term-source').value.trim();
+        const target = document.getElementById('term-target').value.trim();
+        const category = document.getElementById('term-category').value;
+        if (!source || !target) { alert('请填写原文和译文'); return; }
+        this.glossary.add({ source, target, category, locked: true });
+        this._renderGlossary();
+        this.$modalAddTerm.classList.add('hidden');
+        document.getElementById('term-source').value = '';
+        document.getElementById('term-target').value = '';
+    }
+
+    _importGlossary() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json';
+        input.onchange = (e) => {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                try {
+                    const data = JSON.parse(ev.target.result);
+                    if (Array.isArray(data)) {
+                        data.forEach(t => this.glossary.add(t));
+                    }
+                    this._renderGlossary();
+                } catch { alert('JSON 格式错误'); }
+            };
+            reader.readAsText(e.target.files[0]);
+        };
+        input.click();
+    }
+
+    /* ══════════════════════════════
+       文风 & 摘要渲染
+    ══════════════════════════════ */
+    _renderStyle(style) {
+        if (!style) return;
+        const items = [];
+        if (style.tone) items.push(['语调', style.tone]);
+        if (style.formality) items.push(['正式程度', style.formality]);
+        if (style.narrative) items.push(['叙事视角', style.narrative]);
+        if (style.era) items.push(['时代感', style.era]);
+        if (style.vocabulary) items.push(['词汇特点', style.vocabulary]);
+
+        this.$styleContent.innerHTML = `
+            <div class="style-grid">
+                ${items.map(([k, v]) => `<div class="style-item"><div class="style-item-label">${k}</div><div class="style-item-value">${escapeHtml(v)}</div></div>`).join('')}
+            </div>
+            ${style.description ? `<div class="style-description">${escapeHtml(style.description)}</div>` : ''}
+        `;
+    }
+
+    _renderSummary(summary) {
+        if (!summary) return;
+        let html = '';
+        if (summary.global) {
+            html += `<div class="summary-section"><h4>🌍 全局摘要</h4><div class="summary-text">${escapeHtml(summary.global)}</div></div>`;
+        }
+        if (summary.chapters && summary.chapters.length) {
+            html += summary.chapters.map(ch => `
+                <div class="summary-section">
+                    <h4>📖 ${escapeHtml(ch.title)}</h4>
+                    <div class="summary-text">${escapeHtml(ch.content)}</div>
+                </div>
+            `).join('');
+        }
+        this.$summaryContent.innerHTML = html || '<div class="summary-placeholder">暂无摘要</div>';
+    }
+
+    /* ══════════════════════════════
+       弹窗
+    ══════════════════════════════ */
+    _showModal(name) {
+        const map = { settings: this.$modalSettings, addTerm: this.$modalAddTerm, export: this.$modalExport };
+        const modal = map[name];
+        if (modal) modal.classList.remove('hidden');
+    }
+
+    /* ══════════════════════════════
+       设置
+    ══════════════════════════════ */
+    _loadSettings() {
+        this.$apiProvider.value = loadLocal('nf_provider', 'deepseek');
+        this.$apiKey.value = loadLocal('nf_apiKey', '');
+        this.$apiBaseUrl.value = loadLocal('nf_baseUrl', '');
+        this.$apiModel.value = loadLocal('nf_model', '');
+        this.$apiTemp.value = loadLocal('nf_temp', '0.3');
+        this.$apiMaxTokens.value = loadLocal('nf_maxTokens', '1024');
+        this.$customUrlGroup.classList.toggle('hidden', this.$apiProvider.value !== 'custom');
+    }
+
+    _saveSettings() {
+        saveLocal('nf_provider', this.$apiProvider.value);
+        saveLocal('nf_apiKey', this.$apiKey.value);
+        saveLocal('nf_baseUrl', this.$apiBaseUrl.value);
+        saveLocal('nf_model', this.$apiModel.value);
+        saveLocal('nf_temp', this.$apiTemp.value);
+        saveLocal('nf_maxTokens', this.$apiMaxTokens.value);
+        this.$modalSettings.classList.add('hidden');
+    }
+
+    /* ══════════════════════════════
+       导出（核心功能）
+    ══════════════════════════════ */
+    _doExport(format) {
+        if (!this.engine) { alert('没有可导出的翻译结果'); return; }
+        const results = this.engine.getResults();
+        const baseName = this.fileName.replace(/\.[^.]+$/, '');
+
+        switch (format) {
+            case 'txt': {
+                // 纯译文 TXT
+                const lines = [];
+                let currentChapter = '';
+                results.forEach(r => {
+                    if (r.chapter && r.chapter !== currentChapter) {
+                        currentChapter = r.chapter;
+                        lines.push('\n' + currentChapter + '\n');
+                    }
+                    if (r.translated && r.translated !== '__FAILED__') {
+                        lines.push(r.translated);
+                    }
+                });
+                const txt = lines.join('\n');
+                downloadFile(`${baseName}_译文.txt`, txt, 'text/plain;charset=utf-8');
+                break;
+            }
+            case 'bilingual': {
+                // 双语对照 TXT
+                const lines = [];
+                let currentChapter = '';
+                results.forEach((r, i) => {
+                    if (r.chapter && r.chapter !== currentChapter) {
+                        currentChapter = r.chapter;
+                        lines.push('\n═══ ' + currentChapter + ' ═══\n');
+                    }
+                    lines.push(`[${i + 1}] ${r.source}`);
+                    lines.push(`    → ${r.translated || '(未翻译)'}`);
+                    lines.push('');
+                });
+                downloadFile(`${baseName}_双语对照.txt`, lines.join('\n'), 'text/plain;charset=utf-8');
+                break;
+            }
+            case 'json': {
+                // 完整数据 JSON
+                const data = {
+                    fileName: this.fileName,
+                    targetLang: this.$targetLang.value,
+                    totalTokens: this.engine.totalTokens,
+                    exportTime: new Date().toISOString(),
+                    results: results,
+                    glossary: this.glossary ? this.glossary.getAll() : [],
+                    style: this.engine.styleProfile || null,
+                    summary: this.engine.summary || null,
+                };
+                downloadFile(`${baseName}_完整数据.json`, JSON.stringify(data, null, 2), 'application/json');
+                break;
+            }
+            case 'glossary': {
+                // 术语表 JSON
+                const terms = this.glossary ? this.glossary.getAll() : [];
+                downloadFile(`${baseName}_术语表.json`, JSON.stringify(terms, null, 2), 'application/json');
+                break;
+            }
+        }
+
+        this.$modalExport.classList.add('hidden');
+    }
+}
+
+// 全局引用
+let ui;

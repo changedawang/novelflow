@@ -1,0 +1,76 @@
+/* ============================================
+   NovelFlow — 应用入口 + 演示文本
+   ============================================ */
+
+// 演示文本（《指环王》风格片段）
+const DEMO_TEXT = `Chapter 1 The Long-expected Party
+
+When Mr. Bilbo Baggins of Bag End announced that he would shortly be celebrating his eleventy-first birthday with a party of special magnificence, there was much talk and excitement in Hobbiton.
+
+Bilbo was very rich and very peculiar, and had been the wonder of the Shire for sixty years, ever since his remarkable disappearance and unexpected return. The riches he had brought back from his travels had now become a local legend, and it was popularly believed, whatever the old folk might say, that the Hill at Bag End was full of tunnels stuffed with treasure.
+
+And if that was not enough for fame, there was also his prolonged vigour to marvel at. Time wore on, but it seemed to have little effect on Mr. Baggins. At ninety he was much the same as at fifty. At ninety-nine they began to call him well-preserved, but unchanged would have been nearer the mark.
+
+"It will have to be paid for," they said. "It isn't natural, and trouble will come of it!"
+
+But so far trouble had not come; and as Mr. Baggins was generous with his money, most people were willing to forgive him his oddities and his good fortune. He remained on visiting terms with his relatives, except, of course, the Sackville-Bagginses. They had been his enemies for years, and all because of the will.
+
+Gandalf arrived one fine morning in the Shire, riding his great grey horse Shadowfax. The wizard's long grey beard blew in the wind as he made his way along the winding road to Bag End. He had not visited the Shire in many years, and much had changed since his last journey through these peaceful lands.
+
+"Gandalf!" cried Frodo, running down the path to greet the old wizard. "We weren't expecting you until next week!"
+
+"A wizard is never late, Frodo Baggins," said Gandalf with a twinkle in his eye. "Nor is he early. He arrives precisely when he means to."
+
+Chapter 2 The Shadow of the Past
+
+It was not long before Gandalf's visit took a more serious turn. He sat in Bilbo's old study, his pipe sending rings of smoke into the air, and told Frodo of the dark things that were stirring in the world beyond the borders of the Shire.
+
+"The Ring," said Gandalf gravely, "is far more dangerous than you know. It is the One Ring, forged by the Dark Lord Sauron in the fires of Mount Doom. He poured his cruelty, his malice, and his will to dominate all life into that Ring."
+
+Frodo felt a chill run down his spine. He looked at the small golden ring that lay on the table between them. It seemed so harmless, so ordinary.
+
+"What must I do?" asked Frodo in a small voice.
+
+"The Ring must be destroyed," said Gandalf. "And there is only one way to do it. It must be taken to Mordor, to the very fires of Mount Doom where it was made, and cast into the flames."
+
+Frodo's heart sank. Mordor. The very name filled him with dread. It was a land of shadow and darkness, ruled by the Enemy himself.
+
+"I will take the Ring," said Frodo at last, though his voice trembled. "Though I do not know the way."
+
+Gandalf smiled, and there was both sadness and pride in his eyes. "You have a stout heart, Frodo Baggins. And you will not go alone. Samwise Gamgee shall go with you, for I do not think you will get far without him."
+
+At that moment, there was a rustling sound outside the window. Gandalf sprang to his feet and pulled Sam through the opening by his ears.
+
+"Samwise Gamgee!" roared Gandalf. "Have you been eavesdropping?"
+
+"I ain't been dropping no eaves, sir, honest!" stammered Sam, going red to the tips of his ears. "I was just trimming the hedge under the window, if you follow me."
+
+"He will go with you," said Gandalf firmly, releasing Sam's ears. "And it will be the most important garden-path he has ever trodden."
+
+Chapter 3 Three is Company
+
+The three companions set out from Bag End on a cool September morning. The road wound through fields of golden wheat and past orchards heavy with ripe apples. The Shire had never looked more beautiful, and Frodo wondered if he would ever see it again.
+
+They walked in silence for a while, each lost in their own thoughts. Sam carried a heavy pack filled with cooking pots and provisions, while Frodo carried the Ring on a chain around his neck. It felt heavier than it should, as if it knew where they were taking it.
+
+"Mr. Frodo," said Sam suddenly, breaking the silence. "Do you remember what Mr. Bilbo used to say? 'It's a dangerous business, going out your door. You step onto the road, and if you don't keep your feet, there's no knowing where you might be swept off to.'"
+
+Frodo smiled despite himself. "Yes, I remember. And he was right, wasn't he?"
+
+As the sun began to set, painting the sky in shades of orange and purple, they heard the sound of hooves on the road behind them. Gandalf tensed and whispered urgently, "Get off the road! Quick!"
+
+They scrambled into the ditch beside the road and hid beneath the roots of a great oak tree. A black rider appeared on the road, mounted on a horse as dark as midnight. The rider stopped and seemed to sniff the air, as if searching for something.
+
+Frodo felt the Ring grow warm against his chest, and a terrible desire to put it on seized him. He resisted with all his will, pressing himself deeper into the earth.
+
+After what seemed like an eternity, the Black Rider moved on, and the sound of hooves faded into the distance.
+
+"What was that?" whispered Sam, his face pale with fear.
+
+"A servant of the Enemy," said Gandalf grimly. "A Nazgûl, one of the Nine. They are searching for the Ring. We must move quickly now. The road is no longer safe."`;
+
+// ── 初始化应用 ──
+let app;
+document.addEventListener('DOMContentLoaded', () => {
+    app = new UIController();
+});
