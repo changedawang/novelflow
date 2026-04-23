@@ -2298,20 +2298,9 @@ body.innerHTML=h;
 this._bindReaderActions();
 }
 
-    _bindReaderActions(){
-    const body = document.getElementById('reader-body');
-    // 点击段落切换操作按钮显示
-    body.querySelectorAll('.reader-para').forEach(para => {
-        para.addEventListener('click', function(e) {
-            if (e.target.closest('.ra-btn')) return;
-            const actions = this.querySelector('.reader-actions');
-            if (!actions) return;
-            // 隐藏其他段落的按钮
-            body.querySelectorAll('.reader-actions').forEach(a => { if(a !== actions) a.style.display = 'none'; });
-            actions.style.display = actions.style.display === 'none' ? '' : 'none';
-        });
-    });
-    body.querySelectorAll('.ra-ask').forEach(btn=>{
+_bindReaderActions(){
+const body = document.getElementById('reader-body');
+body.querySelectorAll('.ra-ask').forEach(btn=>{
     btn.addEventListener('click', e => {
         e.stopPropagation();
         const idx = parseInt(btn.closest('.reader-para').dataset.idx);
