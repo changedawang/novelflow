@@ -253,16 +253,12 @@ class TranslationEngine {
             const prompt = `提取专名(人/地/物),输出JSON:{"terms":[{"original":"","translation":"","category":"character|location|item|other"}]}\n${chunks[i]}`;
 
             try {
-                const messages = [{ role: 'system', content: 'NER,JSON' }, { role: 'user', content: prompt }];
-                const res = await this._chatWithTrace(messages, {
-                    type: 'translate',
-                    batch: 0,
-                    chapterTitle: `术语提取 (${i + 1}/${chunks.length})`,
-                    temperature: 0.1,
-                    useStream: false
-                });
-                this.tokensInput += (res.usage && res.usage.prompt_tokens) || 0;
-                this.tokensOutput += (res.usage && res.usage.completion_tokens) || 0;
+                const res = await this.llm.chat(
+                    [{ role: 'system', content: 'NER,JSON' }, { role: 'user', content: prompt }],
+                    { temperature: 0.1 }
+                );
+                this.tokensInput += res.usage.prompt_tokens || 0;
+                this.tokensOutput += res.usage.completion_tokens || 0;
 
                 const data = Utils.parseJSON(res.content);
                 if (data && data.terms) this.glossary.addBatch(data.terms);
