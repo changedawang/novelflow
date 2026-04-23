@@ -279,12 +279,23 @@ class LLMAdapter {
         }
 
         const choice = data.choices[0];
-        const content = this._extractChoiceText(choice);
+        let content = this._extractChoiceText(choice);
         const reasoning = this._extractChoiceReasoning(choice);
         const finishReason = String(choice.finish_reason || data.finish_reason || '').trim();
 
-        if (content === null || content === undefined || content === '') {
-            throw new Error('模型返回空内容(content=null)，可能该模型不可用或不支持当前请求，请尝试更换模型');
+        // 推理模型(如kimi-k2.6)可能把结果放在reasoning_content里，content为null
+        if ((!content || content.trim() === '') && reasoning && reasoning.trim()) {
+            // 尝试从reasoning中提取JSON或实际翻译内容
+            const jsonMatch = reasoning.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                content = jsonMatch[0];
+            } else {
+                content = reasoning;
+            }
+        }
+
+        if (!content || content.trim() === '') {
+            throw new Error('模型返回空内容，请尝试更换模型');
         }
 
         return {
@@ -419,52 +430,6 @@ class LLMAdapter {
             }
         }
         throw new Error('获取模型失败: ' + lastError + '。请手动输入模型名称。');
-    }
-    /** 测试当前模型是否可用，返回详细诊断信息 */
-    async testModel() {
-        const result = { ok: false, model: this.model, baseUrl: this.baseUrl, corsProxy: false, details: {} };
-        try {
-            const chatUrl = this.baseUrl + '/chat/completions';
-            const payload = JSON.stringify({
-                model: this.model,
-                messages: [{ role: 'user', content: 'Say "hello" in one word.' }],
-                max_tokens: 20,
-                temperature: 0,
-                stream: false
-            });
-            const opts = {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + this.currentKey },
-                body: payload
-            };
-            const resp = await this._fetchWithCorsRetry(chatUrl, opts);
-            result.corsProxy = this._useCorsProxy;
-            result.details.status = resp.status;
-            const text = await resp.text();
-            result.details.rawResponse = text.slice(0, 800);
-            if (!resp.ok) {
-                result.details.error = `HTTP ${resp.status}`;
-                return result;
-            }
-            const data = JSON.parse(text);
-            const choice = data.choices?.[0];
-            if (!choice) {
-                result.details.error = '无choices';
-                return result;
-            }
-            const msg = choice.message || {};
-            result.details.content = msg.content;
-            result.details.reasoning_content = msg.reasoning_content ? msg.reasoning_content.slice(0, 300) : null;
-            result.details.finish_reason = choice.finish_reason;
-            result.details.usage = data.usage;
-            result.ok = !!(msg.content && msg.content.trim());
-            if (!result.ok && msg.reasoning_content) {
-                result.details.warning = 'content为空但reasoning_content有内容，这是推理模型特性';
-            }
-        } catch (e) {
-            result.details.error = e.message || String(e);
-        }
-        return result;
     }
     countTokens(text) { return Utils.estimateTokens(text); }
 }
