@@ -4,8 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NovelFlow — AI 小说翻译书架</title>
-    <link rel="stylesheet" href="css/style.css?v=20260416b">
-<link rel="stylesheet" href="css/components.css?v=20260416b">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Noto+Serif+SC:wght@400;600;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css?v=20260415g">
+    <link rel="stylesheet" href="css/components.css?v=20260415g">
     <!-- 免费中文字体 -->
     <link href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-screen-webfont@1.7.0/style.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=Noto+Sans+SC:wght@400;500;700&family=Ma+Shan+Zheng&family=ZCOOL+XiaoWei&family=ZCOOL+KuaiLe&family=ZCOOL+QingKe+HuangYou&family=Liu+Jian+Mao+Cao&family=Zhi+Mang+Xing&family=Long+Cang&display=swap" rel="stylesheet">
@@ -328,7 +331,7 @@
         <div class="modal-card">
             <div class="modal-head"><h3>⚙️ API 设置</h3><button class="modal-close" onclick="document.getElementById('modal-settings').classList.add('hidden')">✕</button></div>
             <div class="modal-body">
-                <div class="fg"><label>API 提供商</label><select id="api-provider"><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="custom">自定义</option></select></div>
+                <div class="fg"><label>API 提供商</label><select id="api-provider"><option value="deepseek">DeepSeek (官方)</option><option value="openai">OpenAI 中转 / 优化版</option><option value="custom">自定义提供商</option></select></div>
                 <div class="fg">
                     <label>API Keys <span style="font-weight:400;text-transform:none;font-size:.72rem;color:var(--text-dim)">（多个密钥自动轮询，每行一个）</span></label>
                     <textarea id="api-keys" rows="3" placeholder="sk-key1&#10;sk-key2&#10;sk-key3" style="font-family:var(--font-mono);font-size:.8rem;padding:8px 12px;border:1px solid var(--border-mid);border-radius:var(--r-sm);background:var(--paper-lightest);color:var(--text-primary);width:100%;resize:vertical;outline:none"></textarea>
@@ -441,12 +444,12 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-<script src="js/utils.js?v=20260416b"></script>
-<script src="js/llm-adapter.js?v=20260416b"></script>
-<script src="js/text-splitter.js?v=20260416b"></script>
-<script src="js/glossary-manager.js?v=20260416b"></script>
-<script src="js/translation-engine.js?v=20260416b"></script>
-<script src="js/ui-controller.js?v=20260416b"></script>
-<script src="js/app.js?v=20260416b"></script>
+<script src="js/utils.js?v=20260415c"></script>
+<script src="js/llm-adapter.js?v=20260415c"></script>
+<script src="js/text-splitter.js?v=20260415c"></script>
+<script src="js/glossary-manager.js?v=20260415c"></script>
+<script src="js/translation-engine.js?v=20260415c"></script>
+<script src="js/ui-controller.js?v=20260415c"></script>
+<script src="js/app.js?v=20260415c"></script>
 </body>
 </html>

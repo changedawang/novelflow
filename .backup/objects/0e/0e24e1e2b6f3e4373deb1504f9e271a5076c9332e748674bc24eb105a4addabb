@@ -4,8 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NovelFlow — AI 小说翻译书架</title>
-    <link rel="stylesheet" href="css/style.css?v=20260416b">
-<link rel="stylesheet" href="css/components.css?v=20260416b">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Noto+Serif+SC:wght@400;600;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css?v=20260415g">
+    <link rel="stylesheet" href="css/components.css?v=20260415g">
     <!-- 免费中文字体 -->
     <link href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-screen-webfont@1.7.0/style.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=Noto+Sans+SC:wght@400;500;700&family=Ma+Shan+Zheng&family=ZCOOL+XiaoWei&family=ZCOOL+KuaiLe&family=ZCOOL+QingKe+HuangYou&family=Liu+Jian+Mao+Cao&family=Zhi+Mang+Xing&family=Long+Cang&display=swap" rel="stylesheet">
@@ -441,12 +444,12 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-<script src="js/utils.js?v=20260416b"></script>
-<script src="js/llm-adapter.js?v=20260416b"></script>
-<script src="js/text-splitter.js?v=20260416b"></script>
-<script src="js/glossary-manager.js?v=20260416b"></script>
-<script src="js/translation-engine.js?v=20260416b"></script>
-<script src="js/ui-controller.js?v=20260416b"></script>
-<script src="js/app.js?v=20260416b"></script>
+<script src="js/utils.js?v=20260415c"></script>
+<script src="js/llm-adapter.js?v=20260415c"></script>
+<script src="js/text-splitter.js?v=20260415c"></script>
+<script src="js/glossary-manager.js?v=20260415c"></script>
+<script src="js/translation-engine.js?v=20260415c"></script>
+<script src="js/ui-controller.js?v=20260415c"></script>
+<script src="js/app.js?v=20260415c"></script>
 </body>
 </html>

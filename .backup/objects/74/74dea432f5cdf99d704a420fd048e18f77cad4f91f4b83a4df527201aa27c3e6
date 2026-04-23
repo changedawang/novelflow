@@ -159,40 +159,13 @@ class LLMAdapter {
         if (reasoningMode === 'effort' && options.reasoningEffort) payload.reasoning_effort = options.reasoningEffort;
         if (reasoningMode === 'object' && options.reasoning && typeof options.reasoning === 'object') payload.reasoning = options.reasoning;
 
-        // 通用 CORS 兼容层：自动检测并降级
-        let response;
-        const chatUrl = this.baseUrl + '/chat/completions';
-        const bodyStr = JSON.stringify(payload);
-        try {
-            response = await this._fetchWithTimeout(chatUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + this.currentKey },
-                body: bodyStr,
-            });
-        } catch (corsErr) {
-            if (corsErr && corsErr.message && !corsErr.message.includes('超时') && !corsErr.message.includes('取消')) {
-                try {
-                    response = await this._fetchWithTimeout(chatUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'text/plain', 'Authorization': 'Bearer ' + this.currentKey },
-                        body: bodyStr,
-                    });
-                } catch (_e2) {
-                    try {
-                        const sep = chatUrl.includes('?') ? '&' : '?';
-                        response = await this._fetchWithTimeout(chatUrl + sep + 'key=' + encodeURIComponent(this.currentKey), {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'text/plain' },
-                            body: bodyStr,
-                        });
-                    } catch (_e3) {
-                        throw new Error('无法连接API(CORS限制)。建议换用支持CORS的API地址。原始错误: ' + (corsErr.message || '网络错误'));
-                    }
-                }
-            } else {
-                throw corsErr;
-            }
-        }
+        // 如果是特定易被 CORS 拦截的中转站，改用 text/plain 绕过 OPTIONS 预检请求
+        const contentType = this.baseUrl.includes('ccroute.net') ? 'text/plain' : 'application/json';
+        const response = await this._fetchWithTimeout(this.baseUrl + '/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': contentType, 'Authorization':'Bearer ' + this.currentKey },
+            body: JSON.stringify(payload),
+        });
 
         if (!response.ok) {
             const err = await response.text();
@@ -391,10 +364,8 @@ class LLMAdapter {
 
         let lastError = '';
 
-        // 策略: 对每个URL依次尝试:
-        // 1. 不带Auth头的简单GET请求(避免CORS预检)
-        // 2. 带Auth头的GET请求
-        // 3. 通过CORS代理转发(解决服务端完全不支持CORS的情况)
+        // 策略: 对每个URL先尝试不带Auth头的简单请求(避免CORS预检)，
+        // 失败再尝试带Auth头的请求
         for (const url of urls) {
             // --- 尝试1: 不带 Authorization (简单请求，不触发CORS预检) ---
             try {
@@ -428,58 +399,8 @@ class LLMAdapter {
                     lastError = e.message || '网络错误';
                 }
             }
-
-            // --- 尝试3: 通过CORS代理获取(无Auth和带Auth两种) ---
-            const corsProxies = [
-                'https://api.codetabs.com/v1/proxy/?quest=',
-                'https://api.allorigins.win/raw?url='
-            ];
-            for (const proxy of corsProxies) {
-                // 3a: 代理无Auth
-                try {
-                    const proxyUrl = proxy + encodeURIComponent(url);
-                    const r3 = await this._fetchWithTimeout(proxyUrl, { method: 'GET' });
-                    if (r3.ok) {
-                        const data = await r3.json();
-                        const models = this._parseModelsResponse(data);
-                        if (models && models.length > 0) return models;
-                    }
-                } catch (_e) { /* 静默 */ }
-                // 3b: 代理带Auth(将key附加到原始URL的header参数中)
-                try {
-                    const sep = url.includes('?') ? '&' : '?';
-                    const urlWithAuth = url + sep + 'authorization=Bearer+' + encodeURIComponent(key);
-                    const proxyUrl = proxy + encodeURIComponent(urlWithAuth);
-                    const r3b = await this._fetchWithTimeout(proxyUrl, { method: 'GET' });
-                    if (r3b.ok) {
-                        const data = await r3b.json();
-                        const models = this._parseModelsResponse(data);
-                        if (models && models.length > 0) return models;
-                    }
-                } catch (_e) { /* 静默 */ }
-            }
-
-            // --- 尝试4: 使用 cors-anywhere 风格代理(支持转发请求头) ---
-            const headerProxies = [
-                'https://corsproxy.io/?url=',
-                'https://proxy.cors.sh/'
-            ];
-            for (const proxy of headerProxies) {
-                try {
-                    const proxyUrl = proxy + encodeURIComponent(url);
-                    const r4 = await this._fetchWithTimeout(proxyUrl, {
-                        method: 'GET',
-                        headers: { 'Authorization': 'Bearer ' + key }
-                    });
-                    if (r4.ok) {
-                        const data = await r4.json();
-                        const models = this._parseModelsResponse(data);
-                        if (models && models.length > 0) return models;
-                    }
-                } catch (_e) { /* 静默 */ }
-            }
         }
-        throw new Error(`获取模型失败: ${lastError}。该API可能不支持跨域访问，请手动输入模型名称(如 deepseek-chat, gpt-4o 等)。`);
+        throw new Error(`获取模型失败: ${lastError}。该 API 可能不支持模型列表接口，请手动输入模型名称。`);
     }
     countTokens(text) { return Utils.estimateTokens(text); }
 }
