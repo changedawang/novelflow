@@ -428,7 +428,7 @@ class LLMAdapter {
             const payload = JSON.stringify({
                 model: this.model,
                 messages: [{ role: 'user', content: 'Say "hello" in one word.' }],
-                max_tokens: 20,
+                max_tokens: 500,
                 temperature: 0,
                 stream: false
             });

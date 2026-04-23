@@ -202,7 +202,7 @@ class TranslationEngine {
         try {
             const res = await this.llm.chat(
                 [{ role: 'system', content: 'JSON输出' }, { role: 'user', content: prompt }],
-                { temperature: 0.3, maxTokens: 200 }
+                { temperature: 0.3 }
             );
             this.tokensInput += res.usage.prompt_tokens || 0;
             this.tokensOutput += res.usage.completion_tokens || 0;
@@ -251,7 +251,7 @@ class TranslationEngine {
             try {
                 const res = await this.llm.chat(
                     [{ role: 'system', content: 'NER,JSON' }, { role: 'user', content: prompt }],
-                    { temperature: 0.1, maxTokens: 500 }
+                    { temperature: 0.1 }
                 );
                 this.tokensInput += res.usage.prompt_tokens || 0;
                 this.tokensOutput += res.usage.completion_tokens || 0;
@@ -1081,7 +1081,7 @@ return [
         try {
             const res = await this.llm.chat(
                 [{ role: 'system', content: `摘要≤${maxLen}字` }, { role: 'user', content: prompt }],
-                { temperature: 0.2, maxTokens: 120 }
+                { temperature: 0.2 }
             );
             this.tokensInput += res.usage.prompt_tokens || 0;
             this.tokensOutput += res.usage.completion_tokens || 0;
@@ -1111,7 +1111,7 @@ return [
                     { role: 'system', content: `合并摘要≤${maxLen}字` },
                     { role: 'user', content: allSum }
                 ],
-                { temperature: 0.2, maxTokens: 180 }
+                { temperature: 0.2 }
             );
             this.tokensInput += res.usage.prompt_tokens || 0;
             this.tokensOutput += res.usage.completion_tokens || 0;
