@@ -34,7 +34,7 @@ class LLMAdapter {
             for (const proxy of LLMAdapter.CORS_PROXIES) {
                 try {
                     const proxyResp = await this._fetchWithTimeout(proxy + url, options);
-                    // 代理成功，记住这个代理
+                    // 代理成功(不论HTTP状态码)，记住这个代理
                     this._useCorsProxy = true;
                     this._corsProxyUrl = proxy;
                     console.log('[LLM] CORS代理启用:', proxy);

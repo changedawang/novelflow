@@ -618,7 +618,7 @@ return [
 
     _normalizeReasoningEffort(value, fallback = 'medium') {
         const normalized = String(value || '').trim().toLowerCase();
-        if (['low', 'medium', 'high'].includes(normalized)) return normalized;
+        if (['low', 'medium', 'high', 'xhigh'].includes(normalized)) return normalized;
         if (['precise', 'minimal', 'light', 'weak'].includes(normalized)) return 'low';
         if (['balanced', 'moderate', 'normal', 'mid'].includes(normalized)) return 'medium';
         if (['strong', 'deep', 'extreme', 'very_high', 'max'].includes(normalized)) return 'high';
