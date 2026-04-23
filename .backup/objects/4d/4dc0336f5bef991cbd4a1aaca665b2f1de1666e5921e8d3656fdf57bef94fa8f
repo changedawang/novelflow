@@ -1566,6 +1566,7 @@ ${pairsText}`;
                     chapterIndex: summaries.chapterIndex,
                     chapterTitle: chapterTitle || '',
                     temperature: 0.2,
+                    maxTokens: 1800,
                     reasoningEffort: this._getReasoningEffort('optimize'),
                     useStream: true
                 });
@@ -2469,7 +2470,8 @@ ${pairsText}${contextAfter}
 
         try {
             const res = await this.llm.chat([{ role: 'user', content: prompt }], {
-                temperature: 0.35
+                temperature: 0.35,
+                maxTokens: 2500
             });
             
             this.tokensInput += res.usage.prompt_tokens || 0;
