@@ -259,7 +259,7 @@ class TranslationEngine {
                     batch: 0,
                     chapterTitle: `术语提取 (${i + 1}/${chunks.length})`,
                     temperature: 0.1,
-                    useStream: true
+                    useStream: false
                 });
                 this.tokensInput += (res.usage && res.usage.prompt_tokens) || 0;
                 this.tokensOutput += (res.usage && res.usage.completion_tokens) || 0;
